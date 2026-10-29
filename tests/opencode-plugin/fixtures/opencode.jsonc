@@ -1,0 +1,17 @@
+{
+  // Test-only OpenCode V2 configuration. Never place this in user config.
+  // Loading the plugin does not require Neovim or a running tool server; tool
+  // calls return NO_INSTANCE until a Neovim instance registers itself.
+  // Load it from an isolated OpenCode instance whose XDG directories and
+  // project directory point at temporary locations under /tmp/opencode.
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    {
+      "package": "../../../opencode-plugin",
+      "options": {
+        "healthTimeoutMs": 1500,
+        "requestTimeoutMs": 10000
+      }
+    }
+  ]
+}

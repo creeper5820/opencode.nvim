@@ -1,0 +1,19 @@
+# Test and build artifacts
+node_modules/
+dist/
+*.log
+/tmp/
+nvim.log
+
+# Local editor and OpenCode state
+.opencode/
+*.swp
+*.swo
+*.shada
+tags
+
+# Credentials and local environment files
+.env
+.env.*
+*.token
+credentials.json

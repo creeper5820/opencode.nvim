@@ -1,0 +1,30 @@
+{
+  "name": "opencode-nvim-tools",
+  "version": "0.1.0",
+  "description": "OpenCode V2 server plugin that exposes Neovim open/notify/diff tools",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.ts",
+    "./server": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "index.ts"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test ../tests/opencode-plugin/*.test.ts"
+  },
+  "dependencies": {
+    "@opencode/plugin": "^2.2.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

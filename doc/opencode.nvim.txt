@@ -1,0 +1,215 @@
+*opencode.nvim*  Native Neovim client for OpenCode V2
+
+==============================================================================
+CONTENTS                                                    *opencode.nvim-contents*
+
+1. Requirements ............................ |opencode.nvim-requirements|
+2. Setup ................................... |opencode.nvim-setup|
+3. Commands ................................ |opencode.nvim-commands|
+4. Keymaps ................................. |opencode.nvim-keymaps|
+5. Semantic keybindings .................... |opencode.nvim-keybindings|
+6. Optional OpenCode companion ............. |opencode.nvim-companion|
+7. Health .................................. |opencode.nvim-health|
+8. Testing isolation ....................... |opencode.nvim-testing|
+9. Limitations ............................. |opencode.nvim-limitations|
+
+==============================================================================
+1. REQUIREMENTS                                        *opencode.nvim-requirements*
+
+- Neovim >= 0.10 (uses |vim.uv|, |vim.fs| and window-local 'winbar').
+- A local OpenCode V2 server reachable over `http://`.
+- Optional: the `opencode-plugin/` TypeScript package for OpenCode -> Neovim
+  tools. It is not required by the Neovim plugin.
+
+The plugin never injects keys into a terminal UI and does not start, stop or
+discover an OpenCode service.
+
+==============================================================================
+2. SETUP                                                     *opencode.nvim-setup*
+
+Call setup once from your configuration:
+
+>lua
+  require("opencode").setup({
+    server = {
+      url = "http://127.0.0.1:4096",
+      headers = {},
+    },
+  })
+<
+
+If the server uses a password, pass a Basic authorization header:
+
+>lua
+  require("opencode").setup({
+    server = {
+      url = "http://127.0.0.1:4096",
+      headers = {
+        Authorization = "Basic " .. vim.base64.encode("opencode:PASSWORD"),
+      },
+    },
+  })
+<
+
+                                                       *opencode.nvim-config*
+All options (defaults shown):
+
+>lua
+  {
+    server = { url = "http://127.0.0.1:4096", headers = {} },
+    project = { root = nil },
+    sidebar = { width = 48, input_height = 8 },
+    keymaps = {
+      toggle = "<leader>oo",
+      send_selection = "<leader>os",
+      question_selection = "<leader>oq",
+      submit = "<C-s>",
+    },
+    keybindings = {
+      enabled = true,
+      cli_path = nil,
+      read_cli = true,
+      overrides = {},
+      sequence_timeout = nil,
+    },
+    completion = {
+      enabled = true, auto = true, minimum_length = 1,
+      debounce = 100, limit = 20,
+      cache_ttl = 30000, file_cache_ttl = 0,
+    },
+    status = { enabled = true, spinner_interval = 1000, submit_hint = nil },
+    tools = { enabled = true, registry_dir = nil, instance_id = nil },
+  }
+<
+
+Set any keymap to `false` to disable it. `setup()` is safe to call repeatedly:
+old keymaps, command definitions, subscriptions, tool registry entries and
+session state are replaced.
+
+==============================================================================
+3. COMMANDS                                               *opencode.nvim-commands*
+
+:OpenCode [toggle|open|close|submit|interrupt|reset|health]
+        Main command. With no argument it toggles the sidebar.
+        `reset` stops the current synchronizer, drops the session and restores
+        or creates a new session. `interrupt` calls the session interrupt API.
+
+:OpenCodeToggle
+        Open or hide the sidebar.
+
+:OpenCodeSubmit
+        Submit the sidebar input.
+
+:OpenCodeHealth
+        Print core health plus semantic-keybinding diagnostics. Core checks
+        are also available through `:checkhealth opencode`.
+
+==============================================================================
+4. KEYMAPS                                                 *opencode.nvim-keymaps*
+
+<leader>oo       Normal      Open or hide the sidebar.
+<leader>os       Visual      Append selection context to the input draft.
+<leader>oq       Visual      Open an editable float and ask about the selection.
+<C-s>            Insert/Normal in the input buffer; submit the draft.
+<C-d>/<C-u>      Normal in the messages buffer; scroll half a page.
+<C-f>/<C-b>      Normal in the messages buffer; scroll a full page.
+
+The output and input areas are two real windows. Submit and interrupt mappings
+are buffer-local. No mapping is installed in ordinary code buffers, and no
+global Insert-mode handler is used. `<Esc>` in Insert mode keeps its native
+meaning.
+
+==============================================================================
+5. SEMANTIC KEYBINDINGS                              *opencode.nvim-keybindings*
+
+OpenCode V2 `cli.json` command IDs are mapped to buffer-local Neovim actions.
+The first supported command is `session.interrupt`.
+
+Resolution order:
+1. `keybindings.cli_path`, when set.
+2. Otherwise `$OPENCODE_CONFIG_DIR/cli.json`, or
+   `$XDG_CONFIG_HOME/opencode/cli.json` (falling back to `~/.config`).
+3. Neovim `keybindings.overrides` always win.
+4. `keybindings.read_cli = false` disables reading the file.
+
+The default is a single Normal-mode `<Esc>`. A double Escape can be written as
+`escapeescape`, `<Esc><Esc>` or `escape escape`:
+
+>lua
+  require("opencode").setup({
+    keybindings = {
+      overrides = { ["session.interrupt"] = "escapeescape" },
+      sequence_timeout = 300,
+    },
+  })
+<
+
+Constraints:
+- Insert-mode `<Esc>` always exits Insert first and never calls interrupt.
+- `session.interrupt` is Normal-mode only; Visual mode is not mapped.
+- An idle-session interrupt is a server no-op and is not an error.
+- Unsupported keys, unknown command IDs, prefix conflicts and existing
+  buffer-local conflicts are non-blocking diagnostics. Conflicting mappings are
+  skipped. Run `:OpenCodeHealth` to inspect them.
+
+==============================================================================
+6. OPTIONAL OPENCODE COMPANION                        *opencode.nvim-companion*
+
+`opencode-plugin/` is an optional OpenCode server plugin that registers
+`neovim_open`, `neovim_notify` and `neovim_diff`. Install/load it independently
+from OpenCode, for example:
+
+>jsonc
+  {
+    "$schema": "https://opencode.ai/config.json",
+    "plugins": ["opencode-nvim-tools"]
+  }
+<
+
+The Neovim plugin does not detect or require this package. Without it, setup,
+health, chat, completion and status are unaffected; only OpenCode -> Neovim
+tool calls are unavailable.
+
+When `tools.enabled = true`, the Neovim plugin starts a local HTTP server on an
+ephemeral loopback port with a generated bearer token and writes a registry
+entry under `stdpath("state")/opencode/tools` (or `tools.registry_dir` /
+`$OPENCODE_NVIM_REGISTRY_DIR`). `neovim_diff` only displays content and never
+writes to disk. Disable the local server with `tools.enabled = false`.
+
+==============================================================================
+7. HEALTH                                                     *opencode.nvim-health*
+
+`:checkhealth opencode` checks Neovim version, `vim.uv`, configuration and the
+server URL. It does not require the optional companion.
+
+`:OpenCodeHealth` prints the same core checks plus semantic-keybinding
+diagnostics (unsupported keys, CLI parsing issues and mapping conflicts).
+
+==============================================================================
+8. TESTING ISOLATION                                        *opencode.nvim-testing*
+
+Run tests only through the isolated runner:
+
+>sh
+  bash tests/run.sh
+  bash tests/run.sh tests/integration/e2e
+  OPENCODE_TEST_BIN=opencode bash tests/run.sh tests/integration/e2e
+<
+
+The runner and harness create temporary HOME, XDG config/data/state/cache,
+runtime, shada and project directories under `/tmp/opencode`. E2E tests start
+their own headless Neovim processes and, when available, their own OpenCode V2
+server on a random loopback port with an isolated project and registry. They do
+not connect to the user's Neovim, default OpenCode service, configuration or
+project. Real-service tests skip when no OpenCode binary is configured.
+
+==============================================================================
+9. LIMITATIONS                                         *opencode.nvim-limitations*
+
+- Local `http://` only; HTTPS/TLS is not implemented.
+- One current project/session per Neovim instance; no session picker yet.
+- Permission requests are displayed but cannot be answered yet.
+- Native diffs are read-only; proposed content is not written to disk.
+- No terminal key injection or global `on_key` hook.
+
+vim:tw=78:ts=8:noet:ft=help:norl:
