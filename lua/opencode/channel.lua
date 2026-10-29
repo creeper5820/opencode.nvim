@@ -1,8 +1,8 @@
 -- Test-friendly terminal channel.
 --
 -- Production code uses terminal:channel().  Tests can inject this fake channel
--- into selection actions and the router to verify exact PTY writes without
--- starting OpenCode or touching a user instance.
+-- into selection actions to verify exact PTY writes without starting OpenCode
+-- or touching a user instance.
 
 local M = {}
 

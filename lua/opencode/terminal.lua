@@ -132,6 +132,8 @@ function M.new(opts)
       exit_code = nil,
       generation = 0,
       stopping = false,
+      remembered_width = nil,
+      applying_width = false,
     },
     autocmds = {},
   }, Terminal)
@@ -149,6 +151,47 @@ function Terminal:_clear_autocmds()
     pcall(vim.api.nvim_del_autocmd, id)
   end
   self.autocmds = {}
+end
+
+function Terminal:_remember_width()
+  local window = self.config.window or {}
+  if window.remember_width == false then
+    return
+  end
+  if window.layout ~= "right" and window.layout ~= "left" then
+    return
+  end
+  local win = self.state.win
+  if not valid_win(win) then
+    return
+  end
+  local ok, width = pcall(vim.api.nvim_win_get_width, win)
+  if ok and type(width) == "number" and width > 0 then
+    self.state.remembered_width = width
+  end
+end
+
+function Terminal:_apply_remembered_width()
+  local window = self.config.window or {}
+  if window.remember_width == false then
+    return
+  end
+  if window.layout ~= "right" and window.layout ~= "left" then
+    return
+  end
+  local win = self.state.win
+  local width = self.state.remembered_width
+  if not valid_win(win) or type(width) ~= "number" then
+    return
+  end
+  local clamped = math.max(1, math.min(width, math.max(1, vim.o.columns - 1)))
+  local ok, current = pcall(vim.api.nvim_win_get_width, win)
+  if not ok or current == clamped or self.state.applying_width then
+    return
+  end
+  self.state.applying_width = true
+  pcall(vim.api.nvim_win_set_width, win, clamped)
+  self.state.applying_width = false
 end
 
 function Terminal:_watch_window(win)
@@ -169,6 +212,25 @@ function Terminal:_watch_window(win)
   })
   if ok and id then
     self.autocmds[#self.autocmds + 1] = id
+  end
+  if vim.fn.exists("##WinResized") ~= 0 then
+    local resized_ok, resized_id = pcall(vim.api.nvim_create_autocmd, "WinResized", {
+      callback = function()
+        if self.state.applying_width then
+          return
+        end
+        local windows = vim.v.event and vim.v.event.windows or {}
+        for _, window_id in ipairs(windows) do
+          if window_id == self.state.win then
+            self:_remember_width()
+            break
+          end
+        end
+      end,
+    })
+    if resized_ok and resized_id then
+      self.autocmds[#self.autocmds + 1] = resized_id
+    end
   end
 end
 
@@ -232,6 +294,7 @@ function Terminal:_show_window()
   self.state.win = win
   self:_set_window_options(win)
   self:_resize(win)
+  self:_apply_remembered_width()
   self:_watch_window(win)
   return win
 end
@@ -518,6 +581,7 @@ end
 
 --- Hide the terminal window without stopping the OpenCode process.
 function Terminal:close()
+  self:_remember_width()
   if valid_win(self.state.win) then
     pcall(vim.api.nvim_win_close, self.state.win, true)
   end
@@ -528,6 +592,7 @@ end
 --- Stop only the process owned by this controller and delete its buffer.
 function Terminal:stop(opts)
   opts = opts or {}
+  self:_remember_width()
   self.state.stopping = true
   local job = self.state.job
   local pid = self.state.pid
@@ -582,6 +647,7 @@ function Terminal:get_state()
     cmd = self.state.cmd and vim.deepcopy(self.state.cmd) or nil,
     started_at = self.state.started_at,
     exit_code = self.state.exit_code,
+    remembered_width = self.state.remembered_width,
   }
 end
 

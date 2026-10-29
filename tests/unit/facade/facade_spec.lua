@@ -8,22 +8,8 @@ local function tempdir()
   return dir
 end
 
-local function has_mapping(buf, lhs)
-  local raw = vim.api.nvim_replace_termcodes(lhs, true, false, true)
-  local wanted = vim.fn.keytrans(raw)
-  for _, map in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
-    if map.lhs == lhs or map.lhsraw == raw then
-      return true
-    end
-    if type(map.lhsraw) == "string" and vim.fn.keytrans(map.lhsraw) == wanted then
-      return true
-    end
-  end
-  return false
-end
-
 test.describe("public facade", function()
-  test.it("opens a terminal, routes focus and primitives, hides and stops", function()
+  test.it("opens a terminal, hides and stops it, and keeps Terminal mode wiring", function()
     pcall(function()
       require("opencode").stop()
     end)
@@ -32,39 +18,34 @@ test.describe("public facade", function()
     local dir = tempdir()
     opencode.setup({
       cmd = { "sh", "-c", "printf ready; sleep 20" },
-      window = { layout = "right", size = 40, start_insert = false },
-      keybindings = { read_cli = false },
+      window = { layout = "right", size = 40 },
     })
 
     local ok, err = opencode.open({ directory = dir })
     test.truthy(ok, tostring(err))
     test.truthy(opencode.is_open())
     test.truthy(opencode.is_running())
-    test.equal("composer", opencode.get_focus())
+    test.equal("terminal", vim.bo[vim.api.nvim_get_current_buf()].buftype)
 
     local commands = vim.api.nvim_get_commands({})
     for _, name in ipairs({
       "OpenCode", "OpenCodeToggle", "OpenCodeOpen", "OpenCodeClose",
       "OpenCodeStop", "OpenCodeContinue", "OpenCodeSession", "OpenCodeSubmit",
-      "OpenCodeFocusInput", "OpenCodeFocusSession", "OpenCodeHealth",
+      "OpenCodeHealth",
     }) do
       test.truthy(commands[name], "missing command " .. name)
     end
+    test.falsy(commands.OpenCodeFocusInput)
+    test.falsy(commands.OpenCodeFocusSession)
 
     local state = opencode.get_state()
-    test.truthy(state.router.attached)
-    test.truthy(has_mapping(state.terminal.buffer, "<C-x>n"))
-    test.deep_equal({}, vim.api.nvim_buf_get_keymap(state.terminal.buffer, "i"))
+    test.truthy(state.terminal.running)
+    test.equal(nil, state.router)
+    test.equal(nil, state.focus)
 
-    test.truthy(opencode.focus_session())
-    test.equal("session", opencode.get_focus())
-    test.equal("session", opencode.get_focus_state().region)
-    test.truthy(opencode.focus_input())
-    test.equal("composer", opencode.get_focus())
-
-    test.truthy(opencode.map_primitive("gl", "page_down"))
-    test.truthy(opencode.primitive("page_down", 2))
-    test.truthy(opencode.unmap_primitive("gl"))
+    test.truthy(opencode.focus())
+    test.truthy(opencode.paste("hello"))
+    test.truthy(opencode.submit())
 
     opencode.close()
     test.falsy(opencode.is_open())

@@ -1,17 +1,12 @@
 -- Public facade for the embedded official OpenCode TUI.
 --
--- The plugin is a terminal host, not a chat client.  `opencode` draws the
--- session, composer and viewport; this module owns the process lifecycle,
--- buffer-local input routing, logical focus/region state, and selection
--- actions.  There is no HTTP client, session store, block renderer, completion
--- source or dual-buffer chat UI.
+-- The plugin is only a terminal host.  OpenCode owns the renderer, composer,
+-- dialogs, keybindings, leader handling, Alt keys, selection and viewport.
+-- Neovim keeps the terminal window in Terminal mode while it is focused; there
+-- is no second input router, logical focus region or Normal-mode translation.
 
 local config = require("opencode.config")
-local focus_module = require("opencode.focus")
-local router_module = require("opencode.router")
 local terminal_module = require("opencode.terminal")
-local keybindings = require("opencode.keybindings")
-local primitives = require("opencode.primitives")
 local selection = require("opencode.actions.selection")
 
 local M = {}
@@ -51,119 +46,59 @@ local function error_message(err)
   return tostring(err)
 end
 
-local function resolve_keybindings(cfg)
-  if cfg.keybindings.enabled == false then
-    return {
-      bindings = {},
-      diagnostics = {
-        { level = "info", code = "keybindings_disabled", message = "OpenCode keybindings are disabled" },
-      },
-      leader = nil,
-      leader_timeout = nil,
-      sequence_timeout = 0,
-      cli = { path = cfg.keybindings.cli_path, loaded = false },
-    }
-  end
-  local opts = {
-    read_cli = cfg.keybindings.read_cli,
-    overrides = cfg.keybindings.overrides,
-    sequence_timeout = cfg.keybindings.sequence_timeout,
-  }
-  if cfg.keybindings.cli_path ~= nil then
-    opts.cli_path = cfg.keybindings.cli_path
-  end
-  return keybindings.resolve(opts)
+local function terminal_is_current(rt)
+  return rt.terminal:is_open()
+    and valid_win(rt.terminal.state.win)
+    and vim.api.nvim_get_current_win() == rt.terminal.state.win
+    and valid_buf(rt.terminal.state.buf)
+    and vim.api.nvim_get_current_buf() == rt.terminal.state.buf
 end
 
-local function apply_focus_mode(rt)
-  if not rt.terminal:is_open() then
-    return
-  end
-  if rt.focus:get() == "composer" then
-    if rt.config.window.start_insert ~= false then
-      pcall(vim.cmd, "startinsert")
-    end
-  else
-    pcall(vim.cmd, "stopinsert")
-  end
-end
-
-local function ensure_router(rt)
-  if not rt.terminal:is_running() then
-    return
-  end
+--- Keep global Terminal-mode mappings from stealing keys from the embedded TUI.
+--- Each global Term-mode mapping is shadowed in the OpenCode buffer by a raw
+--- byte forward of its own lhs.  This is still plain pass-through: there is no
+--- Normal routing, command matching or state machine.
+local function install_terminal_passthrough(rt)
   local buf = rt.terminal.state.buf
-  if not valid_buf(buf) then
+  if not valid_buf(buf) or rt.passthrough_buf == buf then
     return
   end
-  if rt.router.attached and rt.router.buf == buf then
+  rt.passthrough_buf = buf
+  local ok, maps = pcall(vim.api.nvim_get_keymap, "t")
+  if not ok or type(maps) ~= "table" then
     return
   end
-  local ok, err = rt.router:attach(buf)
-  if not ok then
-    rt.input_error = { code = "router_attach_failed", message = err }
-  else
-    rt.input_error = nil
-  end
-end
-
-local function new_runtime(cfg)
-  local focus = focus_module.new({ initial = cfg.focus.initial })
-  local rt = {
-    config = cfg,
-    focus = focus,
-    keybindings = resolve_keybindings(cfg),
-    mappings = {},
-  }
-
-  rt.terminal = terminal_module.new({
-    config = cfg,
-    notify = notify,
-    on_exit = function(code)
-      if runtime ~= rt then
-        return
+  for _, map in ipairs(maps) do
+    if type(map.lhs) == "string" and map.lhs ~= "" then
+      local bytes_ok, bytes = pcall(vim.api.nvim_replace_termcodes, map.lhs, true, false, true)
+      if bytes_ok and type(bytes) == "string" and bytes ~= "" then
+        pcall(vim.keymap.set, "t", map.lhs, function()
+          rt.terminal:send(bytes)
+        end, {
+          buffer = buf,
+          silent = true,
+          nowait = true,
+          noremap = true,
+          desc = "OpenCode: pass through " .. map.lhs,
+        })
       end
-      rt.router:detach()
-      rt.last_exit = code
-    end,
-  })
-
-  rt.router = router_module.new({
-    focus = focus,
-    channel = function()
-      return rt.terminal:channel()
-    end,
-    keybindings = rt.keybindings,
-    config = cfg,
-    notify = notify,
-    on_focus = function(region)
-      if runtime ~= rt then
-        return
-      end
-      if region == "composer" then
-        if cfg.window.start_insert ~= false then
-          pcall(vim.cmd, "startinsert")
-        end
-      else
-        pcall(vim.cmd, "stopinsert")
-      end
-    end,
-  })
-  return rt
-end
-
--- ---------------------------------------------------------------------------
--- Keymaps / commands / autocmds
--- ---------------------------------------------------------------------------
-
-local function uninstall_keymaps(rt)
-  for _, mapping in ipairs(rt.mappings or {}) do
-    local current = vim.fn.maparg(mapping.lhs, mapping.mode, false, true)
-    if type(current) == "table" and current.desc == mapping.desc then
-      pcall(vim.keymap.del, mapping.mode, mapping.lhs)
     end
   end
-  rt.mappings = {}
+end
+
+--- Keep the focused OpenCode window in Terminal mode.  The TUI receives every
+--- key directly; no Normal-mode operation routing is installed.
+local function enter_terminal_mode(rt)
+  if not rt or runtime ~= rt or not terminal_is_current(rt) or not rt.terminal:is_running() then
+    return false
+  end
+  if rt.restoring_terminal then
+    return true
+  end
+  rt.restoring_terminal = true
+  local ok = pcall(vim.cmd, "startinsert")
+  rt.restoring_terminal = false
+  return ok
 end
 
 local function install_keymap(rt, mode, lhs, callback, desc)
@@ -190,6 +125,16 @@ local function install_keymaps(rt)
   install_keymap(rt, "x", keymaps.question_selection, function()
     selection.question_selection()
   end, KEYMAP_DESC.question_selection)
+end
+
+local function uninstall_keymaps(rt)
+  for _, mapping in ipairs(rt.mappings or {}) do
+    local current = vim.fn.maparg(mapping.lhs, mapping.mode, false, true)
+    if type(current) == "table" and current.desc == mapping.desc then
+      pcall(vim.keymap.del, mapping.mode, mapping.lhs)
+    end
+  end
+  rt.mappings = {}
 end
 
 local function install_commands(rt)
@@ -224,12 +169,6 @@ local function install_commands(rt)
       end
     elseif sub == "new" then
       M.open({ directory = parts[2], session = false, continue = false })
-    elseif sub == "focus-input" then
-      M.focus_input()
-    elseif sub == "focus-session" then
-      M.focus_session()
-    elseif sub == "focus-next" then
-      M.focus_next()
     elseif sub == "submit" then
       M.submit()
     elseif sub == "health" then
@@ -240,7 +179,7 @@ local function install_commands(rt)
   end, {
     nargs = "*",
     complete = function()
-      return { "toggle", "open", "close", "stop", "restart", "continue", "session", "new", "focus-input", "focus-session", "focus-next", "submit", "health" }
+      return { "toggle", "open", "close", "stop", "restart", "continue", "session", "new", "submit", "health" }
     end,
     desc = "OpenCode TUI",
   })
@@ -270,12 +209,6 @@ local function install_commands(rt)
   command("OpenCodeSubmit", function()
     M.submit()
   end, { desc = "Submit the OpenCode composer" })
-  command("OpenCodeFocusInput", function()
-    M.focus_input()
-  end, { desc = "Focus the OpenCode composer region" })
-  command("OpenCodeFocusSession", function()
-    M.focus_session()
-  end, { desc = "Focus the OpenCode session region" })
   command("OpenCodeHealth", function()
     M.print_health()
   end, { desc = "Show OpenCode health information" })
@@ -288,38 +221,41 @@ local function install_commands(rt)
     "OpenCodeContinue",
     "OpenCodeSession",
     "OpenCodeSubmit",
-    "OpenCodeFocusInput",
-    "OpenCodeFocusSession",
     "OpenCodeHealth",
   }
 end
 
-local function install_autocmds(rt)
-  local group = vim.api.nvim_create_augroup("OpencodeNvimIntegration", { clear = true })
+local function install_terminal_autocmds(rt)
+  local group = vim.api.nvim_create_augroup("OpencodeNvimTerminalMode", { clear = true })
   rt.augroup = group
-  vim.api.nvim_create_autocmd("WinLeave", {
+
+  local function enforce()
+    if runtime ~= rt then
+      return
+    end
+    if terminal_is_current(rt) then
+      enter_terminal_mode(rt)
+    end
+  end
+
+  vim.api.nvim_create_autocmd({ "WinEnter", "BufEnter", "BufWinEnter" }, {
     group = group,
-    callback = function()
-      if runtime ~= rt then
-        return
-      end
-      local win = vim.api.nvim_get_current_win()
-      if win == rt.terminal.state.win then
-        rt.focus:leave()
-      end
-    end,
+    callback = enforce,
   })
-  vim.api.nvim_create_autocmd("WinEnter", {
+  vim.api.nvim_create_autocmd("ModeChanged", {
     group = group,
     callback = function()
       if runtime ~= rt then
         return
       end
-      local win = vim.api.nvim_get_current_win()
-      if win == rt.terminal.state.win then
-        rt.focus:enter()
-        ensure_router(rt)
-        apply_focus_mode(rt)
+      if not terminal_is_current(rt) then
+        return
+      end
+      local mode = vim.api.nvim_get_mode().mode
+      if mode ~= "t" then
+        vim.schedule(function()
+          enforce()
+        end)
       end
     end,
   })
@@ -329,15 +265,28 @@ local function install_autocmds(rt)
       if runtime ~= rt then
         return
       end
-      rt.router:detach()
       rt.terminal:stop({ timeout = 1000 })
     end,
   })
 end
 
--- ---------------------------------------------------------------------------
--- Runtime lifecycle
--- ---------------------------------------------------------------------------
+local function new_runtime(cfg)
+  local rt = {
+    config = cfg,
+    mappings = {},
+  }
+  rt.terminal = terminal_module.new({
+    config = cfg,
+    notify = notify,
+    on_exit = function(code)
+      if runtime ~= rt then
+        return
+      end
+      rt.last_exit = code
+    end,
+  })
+  return rt
+end
 
 local function teardown_runtime()
   local rt = runtime
@@ -346,9 +295,6 @@ local function teardown_runtime()
     return
   end
   pcall(selection._reset)
-  if rt.router then
-    pcall(rt.router.detach, rt.router)
-  end
   if rt.terminal then
     pcall(rt.terminal.stop, rt.terminal)
   end
@@ -359,7 +305,7 @@ local function teardown_runtime()
 end
 
 --- Configure the plugin.  Safe to call repeatedly; the previous terminal
---- process, buffer-local mappings and autocmds are replaced.
+--- process, keymaps and autocmds are replaced.
 --- @param opts table|nil
 --- @return table resolved configuration
 function M.setup(opts)
@@ -369,22 +315,33 @@ function M.setup(opts)
   local rt = new_runtime(resolved)
   runtime = rt
 
+  local function selection_channel()
+    if runtime ~= rt then
+      return nil
+    end
+    if not rt.terminal:is_running() then
+      local ok = M.open({ focus = false })
+      if not ok then
+        return nil
+      end
+    end
+    return rt.terminal:channel()
+  end
+
   selection.setup({
-    channel = function()
-      return rt.terminal:channel()
-    end,
+    channel = selection_channel,
     focus_input = function()
-      M.focus_input({ open = false })
+      return M.focus()
     end,
     open = function()
-      M.open()
+      return M.open()
     end,
     notify = notify,
   })
 
   install_keymaps(rt)
   install_commands(rt)
-  install_autocmds(rt)
+  install_terminal_autocmds(rt)
 
   if was_open then
     M.open()
@@ -408,6 +365,26 @@ local function ensure_runtime()
   return runtime
 end
 
+--- Enter Terminal mode in the OpenCode window if it is currently focused.
+--- @return boolean ok
+function M.focus()
+  local rt = ensure_runtime()
+  if not rt.terminal:is_running() then
+    local opened, err = M.open()
+    if not opened then
+      return false, err
+    end
+  else
+    local focused, err = rt.terminal:focus()
+    if not focused then
+      return false, err
+    end
+  end
+  install_terminal_passthrough(rt)
+  enter_terminal_mode(rt)
+  return true
+end
+
 --- Open (or reveal) the embedded official TUI.
 --- @param opts table|nil { directory, session, continue, prompt, args, focus }
 --- @return boolean ok
@@ -419,12 +396,16 @@ function M.open(opts)
     notify("OpenCode: " .. error_message(err), vim.log.levels.ERROR)
     return false, err
   end
-  ensure_router(rt)
   if opts and opts.focus == false then
     return true
   end
-  rt.focus:enter()
-  apply_focus_mode(rt)
+  local focused, focus_error = rt.terminal:focus()
+  if not focused then
+    notify("OpenCode: " .. error_message(focus_error), vim.log.levels.ERROR)
+    return false, focus_error
+  end
+  install_terminal_passthrough(rt)
+  enter_terminal_mode(rt)
   return true
 end
 
@@ -459,7 +440,6 @@ end
 --- installed; the next open() starts a fresh TUI.
 function M.stop()
   if runtime then
-    runtime.router:detach()
     runtime.terminal:stop()
   end
   return true
@@ -468,82 +448,8 @@ end
 --- Restart with optional new per-open flags.
 function M.restart(opts)
   local rt = ensure_runtime()
-  rt.router:detach()
   rt.terminal:stop()
   return M.open(opts)
-end
-
-local function focus_region(region, opts)
-  opts = opts or {}
-  local rt = ensure_runtime()
-  if not rt.terminal:is_running() then
-    local ok = M.open(opts)
-    if not ok then
-      return false
-    end
-  elseif not rt.terminal:is_open() then
-    local ok, err = rt.terminal:focus()
-    if not ok then
-      notify("OpenCode: " .. error_message(err), vim.log.levels.ERROR)
-      return false
-    end
-  end
-  local ok, err = rt.focus:set(region, "explicit")
-  if not ok then
-    notify("OpenCode: " .. error_message(err), vim.log.levels.ERROR)
-    return false
-  end
-  local focused, focus_error = rt.terminal:focus()
-  if not focused then
-    notify("OpenCode: " .. error_message(focus_error), vim.log.levels.ERROR)
-    return false
-  end
-  ensure_router(rt)
-  if region == "composer" then
-    if opts.insert ~= false and rt.config.window.start_insert ~= false then
-      pcall(vim.cmd, "startinsert")
-    end
-  else
-    pcall(vim.cmd, "stopinsert")
-  end
-  return true
-end
-
---- Explicitly focus the logical composer region.
---- @param opts table|nil { insert = boolean }
-function M.focus_input(opts)
-  return focus_region("composer", opts)
-end
-
---- Explicitly focus the logical session region.
-function M.focus_session(opts)
-  return focus_region("session", opts)
-end
-
---- Switch logical regions without inspecting cursor movement or screen rows.
-function M.focus_next()
-  local rt = ensure_runtime()
-  local region = rt.focus:toggle()
-  if region == "composer" then
-    return M.focus_input({ open = false })
-  end
-  return M.focus_session({ open = false })
-end
-
---- @return "composer"|"session"|nil
-function M.get_focus()
-  if runtime == nil then
-    return nil
-  end
-  return runtime.focus:get()
-end
-
---- @return table|nil
-function M.get_focus_state()
-  if runtime == nil then
-    return nil
-  end
-  return runtime.focus:state()
 end
 
 --- Live terminal channel, or nil when the TUI is not running.
@@ -589,53 +495,6 @@ function M.submit()
   return rt.terminal:submit()
 end
 
---- Execute a public composer/session primitive.  Count is forwarded to the
---- TUI input operation, and the logical focus region never changes.
---- @param name string
---- @param count number|nil
---- @return boolean ok
---- @return string|nil error
-function M.primitive(name, count)
-  local rt = ensure_runtime()
-  return primitives.apply(name, count, {
-    channel = rt.terminal:channel(),
-    focus = rt.focus,
-    keybindings = rt.keybindings,
-  })
-end
-
---- Install a user Normal-mode keymap that invokes a public primitive.  Counts
---- typed before the key are forwarded via vim.v.count1.
---- @param lhs string
---- @param name string
---- @param opts table|nil { count = boolean, desc = string }
-function M.map_primitive(lhs, name, opts)
-  local rt = ensure_runtime()
-  if not rt.terminal:is_running() then
-    local ok = M.open()
-    if not ok then
-      return false, "cannot open OpenCode terminal"
-    end
-  end
-  ensure_router(rt)
-  return rt.router:map_primitive(lhs, name, opts)
-end
-
-function M.unmap_primitive(lhs)
-  local rt = ensure_runtime()
-  return rt.router:unmap(lhs)
-end
-
---- Re-read the effective cli.json and rebuild buffer-local native shortcuts.
-function M.reload()
-  local rt = ensure_runtime()
-  rt.router:detach()
-  rt.keybindings = resolve_keybindings(rt.config)
-  rt.router.keybindings = rt.keybindings
-  ensure_router(rt)
-  return rt.keybindings
-end
-
 function M.send_selection(opts)
   return selection.send_selection(opts)
 end
@@ -655,15 +514,6 @@ function M.get_state()
     configured = true,
     config = copy(rt.config),
     terminal = rt.terminal:get_state(),
-    focus = rt.focus:state(),
-    keybindings = {
-      leader = rt.keybindings.leader,
-      leader_timeout = rt.keybindings.leader_timeout,
-      cli = copy(rt.keybindings.cli),
-      diagnostics = copy(rt.keybindings.diagnostics),
-    },
-    router = rt.router:get_state(),
-    input_error = copy(rt.input_error),
     last_exit = rt.last_exit,
     selection = selection.get_question_state(),
   }
@@ -690,7 +540,5 @@ end
 function M.get_terminal()
   return runtime and runtime.terminal or nil
 end
-
-M.primitives = primitives
 
 return M

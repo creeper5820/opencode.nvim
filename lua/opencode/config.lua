@@ -21,29 +21,14 @@ M.defaults = {
   window = {
     layout = "right", -- right | left | above | below
     size = 80,
-    start_insert = true,
+    -- Remember the user's actual width for vertical layouts within this
+    -- Neovim session.
+    remember_width = true,
   },
   keymaps = {
     toggle = "<leader>oo",
     send_selection = "<leader>os",
     question_selection = "<leader>oq",
-    -- Tab is only installed when it does not collide with an OpenCode
-    -- keybinding from cli.json. Set to false to disable it entirely.
-    focus_next = "<Tab>",
-  },
-  keybindings = {
-    enabled = true,
-    -- nil uses $OPENCODE_CONFIG_DIR/cli.json or the XDG config directory.
-    cli_path = nil,
-    read_cli = true,
-    overrides = {},
-    sequence_timeout = nil,
-  },
-  input = {
-    -- Composer Vim-like editing primitives (h/l/w/b/x/dd/...).
-    primitives = true,
-    -- Forward otherwise unbound Normal-mode keys to the TUI.
-    passthrough = true,
   },
   paste = {
     -- Send bracketed-paste guards around composer text.
@@ -52,9 +37,6 @@ M.defaults = {
     ready_delay = 150,
     -- Separate paste from submit so multiline text is not submitted early.
     submit_delay = 30,
-  },
-  focus = {
-    initial = "composer", -- composer | session
   },
 }
 
@@ -195,40 +177,11 @@ local function validate_config(config)
     error("opencode: window.layout must be one of right, left, above, below", 0)
   end
   validate_dimension("window.size", config.window.size, 1, 1000)
-  if type(config.window.start_insert) ~= "boolean" then
-    error("opencode: window.start_insert must be a boolean", 0)
+  if type(config.window.remember_width) ~= "boolean" then
+    error("opencode: window.remember_width must be a boolean", 0)
   end
 
   validate_keymaps(config.keymaps)
-
-  if type(config.keybindings) ~= "table" then
-    error("opencode: keybindings must be a table", 0)
-  end
-  for _, name in ipairs({ "enabled", "read_cli" }) do
-    if type(config.keybindings[name]) ~= "boolean" then
-      error(("opencode: keybindings.%s must be a boolean"):format(name), 0)
-    end
-  end
-  local cli_path = config.keybindings.cli_path
-  if cli_path ~= nil and (type(cli_path) ~= "string" or cli_path == "") then
-    error("opencode: keybindings.cli_path must be nil or a non-empty string", 0)
-  end
-  if type(config.keybindings.overrides) ~= "table" then
-    error("opencode: keybindings.overrides must be a table", 0)
-  end
-  local sequence_timeout = config.keybindings.sequence_timeout
-  if sequence_timeout ~= nil and (type(sequence_timeout) ~= "number" or sequence_timeout <= 0) then
-    error("opencode: keybindings.sequence_timeout must be nil or a positive number", 0)
-  end
-
-  if type(config.input) ~= "table" then
-    error("opencode: input must be a table", 0)
-  end
-  for _, name in ipairs({ "primitives", "passthrough" }) do
-    if type(config.input[name]) ~= "boolean" then
-      error(("opencode: input.%s must be a boolean"):format(name), 0)
-    end
-  end
 
   if type(config.paste) ~= "table" then
     error("opencode: paste must be a table", 0)
@@ -238,13 +191,6 @@ local function validate_config(config)
   end
   validate_dimension("paste.ready_delay", config.paste.ready_delay, 0, 60000)
   validate_dimension("paste.submit_delay", config.paste.submit_delay, 0, 60000)
-
-  if type(config.focus) ~= "table" then
-    error("opencode: focus must be a table", 0)
-  end
-  if config.focus.initial ~= "composer" and config.focus.initial ~= "session" then
-    error("opencode: focus.initial must be 'composer' or 'session'", 0)
-  end
 end
 
 --- Resolve options against defaults and validate the result.

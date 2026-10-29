@@ -18,7 +18,7 @@ local function config(overrides)
     cwd = nil,
     project = {},
     session = {},
-    window = { layout = "right", size = 40, start_insert = false },
+    window = { layout = "right", size = 40 },
     paste = { bracketed = true, ready_delay = 0, submit_delay = 0 },
   }
   for key, item in pairs(overrides or {}) do
@@ -130,6 +130,52 @@ test.describe("terminal lifecycle", function()
       local ok, result = pcall(vim.uv.kill, pid, 0)
       return not (ok and result == 0)
     end)
+    vim.fn.delete(dir, "rf")
+  end)
+
+  test.it("remembers a manually adjusted vertical width across close/open", function()
+    local dir = tempdir("width")
+    local term = terminal_module.new({
+      config = config({
+        cmd = { "sh", "-c", "sleep 20" },
+        window = { layout = "right", size = 40, remember_width = true },
+      }),
+      env = { TERM = "xterm-256color" },
+    })
+    test.truthy(term:open({ directory = dir }))
+    local win = term.state.win
+    test.truthy(win)
+    local target = math.min(37, vim.o.columns - 2)
+    pcall(vim.api.nvim_win_set_width, win, target)
+    test.equal(target, vim.api.nvim_win_get_width(win))
+
+    term:close()
+    test.truthy(term:open())
+    test.equal(target, vim.api.nvim_win_get_width(term.state.win))
+
+    term:close()
+    term.state.remembered_width = vim.o.columns + 500
+    test.truthy(term:open())
+    test.truthy(vim.api.nvim_win_get_width(term.state.win) <= math.max(1, vim.o.columns - 1))
+    term:stop()
+    vim.fn.delete(dir, "rf")
+  end)
+
+  test.it("can disable width memory", function()
+    local dir = tempdir("width-off")
+    local term = terminal_module.new({
+      config = config({
+        cmd = { "sh", "-c", "sleep 20" },
+        window = { layout = "right", size = 40, remember_width = false },
+      }),
+      env = { TERM = "xterm-256color" },
+    })
+    test.truthy(term:open({ directory = dir }))
+    pcall(vim.api.nvim_win_set_width, term.state.win, math.min(30, vim.o.columns - 2))
+    term:close()
+    test.truthy(term:open())
+    test.equal(40, vim.api.nvim_win_get_width(term.state.win))
+    term:stop()
     vim.fn.delete(dir, "rf")
   end)
 end)

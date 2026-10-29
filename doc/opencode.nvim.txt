@@ -1,277 +1,155 @@
 *opencode.nvim*  Host the official OpenCode TUI in Neovim
 
+OpenCode remains the renderer, composer, dialog owner and input owner.  This
+plugin starts the official `opencode` terminal UI in a Neovim terminal buffer
+and manages its lifecycle, window visibility, selection actions and health
+checks.  It is pure Lua and uses no HTTP client, companion process or extra UI.
+
 ==============================================================================
-CONTENTS                                                    *opencode.nvim-contents*
+CONTENTS                                              *opencode.nvim-contents*
 
 1. Requirements ............................ |opencode.nvim-requirements|
 2. Setup ................................... |opencode.nvim-setup|
 3. Commands ................................ |opencode.nvim-commands|
 4. Keymaps ................................. |opencode.nvim-keymaps|
-5. Terminal lifecycle ...................... |opencode.nvim-terminal|
-6. Input routing ........................... |opencode.nvim-input|
-7. Logical focus ........................... |opencode.nvim-focus|
-8. Primitives .............................. |opencode.nvim-primitives|
-9. Keybindings ............................. |opencode.nvim-keybindings|
-10. Selection actions ...................... |opencode.nvim-selection|
-11. Health ................................. |opencode.nvim-health|
-12. Testing ................................ |opencode.nvim-testing|
-13. Limitations ............................ |opencode.nvim-limitations|
+5. Terminal behaviour ...................... |opencode.nvim-terminal|
+6. Selection actions ....................... |opencode.nvim-selection|
+7. Health .................................. |opencode.nvim-health|
+8. Testing ................................. |opencode.nvim-testing|
 
 ==============================================================================
-1. REQUIREMENTS                                        *opencode.nvim-requirements*
+1. REQUIREMENTS                                    *opencode.nvim-requirements*
 
-- Neovim >= 0.10 (uses |vim.uv|, terminal buffers and buffer-local mappings).
-- The `opencode` CLI available on `$PATH`.
-
-The plugin starts the official CLI in a terminal buffer. It does not require a
-separately started server, TypeScript package or HTTP transport.
+- Neovim >= 0.10 (`vim.uv`, terminal buffers, `vim.keymap`).
+- The `opencode` CLI on `$PATH`.
 
 ==============================================================================
-2. SETUP                                                     *opencode.nvim-setup*
+2. SETUP                                                 *opencode.nvim-setup*
 
->lua
+With lazy.nvim: >lua
+  {
+    "creeper5820/opencode.nvim",
+    config = function()
+      require("opencode").setup()
+    end,
+  }
+<
+All options are optional: >lua
   require("opencode").setup({
     cmd = "opencode",
     args = {},
+    cwd = nil,
     project = { root = nil },
     session = { continue = false, id = nil, prompt = nil },
-    window = { layout = "right", size = 80, start_insert = true },
+    window = {
+      layout = "right",       -- right | left | above | below
+      size = 80,
+      remember_width = true,
+    },
     keymaps = {
       toggle = "<leader>oo",
       send_selection = "<leader>os",
       question_selection = "<leader>oq",
-      focus_next = "<Tab>",
     },
-    keybindings = {
-      enabled = true,
-      cli_path = nil,
-      read_cli = true,
-      overrides = {},
-      sequence_timeout = nil,
+    paste = {
+      bracketed = true,
+      ready_delay = 150,
+      submit_delay = 30,
     },
-    input = { primitives = true, passthrough = true },
-    paste = { bracketed = true, ready_delay = 150, submit_delay = 30 },
-    focus = { initial = "composer" },
   })
 <
-
-`cmd` may be a string or a list. The configured project directory is appended
-as OpenCode's positional directory argument. `session.id` maps to `--session`,
-`session.continue` maps to `--continue`, and `session.prompt` maps to
-`--prompt`.
-
-`setup()` is safe to call repeatedly. The previous terminal process,
-buffer-local mappings and autocmds are replaced.
+For vertical `right`/`left` layouts, `window.remember_width = true` remembers
+the actual width you set during this Neovim session and restores it on reopen,
+clamped to the current `vim.o.columns`.  No file is written.
 
 ==============================================================================
-3. COMMANDS                                               *opencode.nvim-commands*
+3. COMMANDS                                           *opencode.nvim-commands*
 
-:OpenCode [toggle]
-:OpenCode open [dir]
-:OpenCode close
-:OpenCode stop
-:OpenCode restart [dir]
-:OpenCode continue [dir]
-:OpenCode session <id> [dir]
-:OpenCode new [dir]
-:OpenCode focus-input
-:OpenCode focus-session
-:OpenCode focus-next
-:OpenCode submit
-:OpenCode health
-        Main command and subcommands. `close` hides the TUI window while the
-        OpenCode process stays alive. `stop` terminates only the process this
-        plugin started.
+:OpenCode [toggle]             Open or hide the TUI.
+:OpenCode open [dir]           Open in dir.
+:OpenCode close                Hide the window; keep the process alive.
+:OpenCode stop                 Stop the process started by this plugin.
+:OpenCode restart [dir]        Stop and start a fresh TUI.
+:OpenCode continue [dir]       Start with --continue.
+:OpenCode session <id> [dir]   Start or resume a session with --session.
+:OpenCode new [dir]            Start without session/continue flags.
+:OpenCode submit               Send Enter to the TUI composer.
+:OpenCode health               Print health information.
 
-:OpenCodeToggle
-:OpenCodeOpen [dir]
-:OpenCodeClose
-:OpenCodeStop
-:OpenCodeContinue [dir]
-:OpenCodeSession <id> [dir]
-:OpenCodeSubmit
-:OpenCodeFocusInput
-:OpenCodeFocusSession
-:OpenCodeHealth
-        Convenience commands with the same meanings.
+Convenience commands: :OpenCodeToggle, :OpenCodeOpen, :OpenCodeClose,
+:OpenCodeStop, :OpenCodeContinue, :OpenCodeSession, :OpenCodeSubmit,
+:OpenCodeHealth.
 
 ==============================================================================
-4. KEYMAPS                                                 *opencode.nvim-keymaps*
+4. KEYMAPS                                             *opencode.nvim-keymaps*
 
-<leader>oo       Normal      Open or hide the OpenCode TUI.
-<leader>os       Visual      Paste formatted selection context into the TUI
-                             composer; never submits.
-<leader>oq       Visual      Open a real Neovim float, then paste question +
-                             context and submit it.
+<leader>oo   Normal   Open or hide the OpenCode TUI.
+<leader>os   Visual   Paste formatted selection context; never submits.
+<leader>oq   Visual   Open a float, then paste question + context and submit.
 
-Set a keymap to `false` to disable it. These are global editor mappings; all
-terminal input routing is buffer-local.
+Each keymap can be changed or disabled with `false`.  These are global editor
+mappings; the plugin installs no Normal-mode mappings in the terminal buffer.
 
 ==============================================================================
-5. TERMINAL LIFECYCLE                                    *opencode.nvim-terminal*
+5. TERMINAL BEHAVIOUR                               *opencode.nvim-terminal*
 
-The TUI uses one terminal buffer and one Neovim window. Hiding the window does
-not stop the process; the official TUI keeps its composer, viewport and session.
-Use `:OpenCode stop` to terminate it or `:OpenCode restart` to start a fresh
-process.
+The TUI runs in one terminal buffer and one window.  While that window is
+focused it stays in Terminal mode.  OpenCode receives every key directly,
+including text, Enter, Escape, arrows, Alt combinations, the leader key,
+multi-key sequences, dialogs, completion and session navigation.
 
-Per-open flags:
+There is no logical composer/session focus, Normal command table, leader
+replay, Visual emulation, cursor synchronization or click emulation.
 
->lua
-  require("opencode").open({
-    directory = "~/src/project",
-    session = "ses_123",
-    continue = false,
-    prompt = "Review the diff",
-  })
-<
+Global Neovim Terminal-mode mappings are shadowed in the OpenCode buffer by a
+raw byte forward of their own lhs.  This prevents mappings such as LazyVim's
+`t jk` from stealing text.  The forward is plain pass-through and does not
+interpret OpenCode commands.
 
-When a TUI is already running, `open()` reveals it instead of silently changing
-its session. Stop or restart first when changing those flags.
+`WinEnter`, `BufEnter`, `BufWinEnter` and `ModeChanged` re-enter Terminal mode
+when the OpenCode window is focused.  Hiding/revealing uses ordinary Neovim
+terminal window semantics.
 
 ==============================================================================
-6. INPUT ROUTING                                            *opencode.nvim-input*
+6. SELECTION ACTIONS                               *opencode.nvim-selection*
 
-Terminal Insert mode is pass-through: the TUI receives all keys. `<Esc>` keeps
-its Neovim meaning and exits Insert; `<C-\><C-n>` remains available.
+<leader>os extracts the current Visual selection, formats it as Markdown with a
+safe fence and path/line range, opens/focuses the terminal and pastes it into
+the composer.  It never submits.
 
-Normal mode installs buffer-local mappings in the OpenCode terminal buffer:
+<leader>oq opens an editable Neovim float.  On <C-s> it pastes the question and
+context as one bracketed paste, then sends a separate Enter/Submit event after
+a short delay.  The float keeps its text on failure and closes on cancellation.
+Empty questions are rejected.  Text beginning with `/`, `:` or a key name is
+never interpreted as a TUI shortcut because it travels inside a bracketed
+paste; the paste terminator is sanitized.
 
-1. Effective OpenCode `cli.json` bindings, including alternatives, custom
-   leaders, full multi-key sequences and modifier combinations.
-2. Composer/session editing primitives.
-3. The configurable logical-focus key.
-4. Pass-through for otherwise unbound printable/special keys.
-
-There is no global `on_key` hook and no screen-row inspection. `i` and `a`
-enter terminal Insert mode, and `:` / `/` remain Neovim commands. `I` and `A`
-fall back to Neovim when no native OpenCode binding owns them.
+OpenCode owns sessions; the plugin creates or tracks no session ID.
 
 ==============================================================================
-7. LOGICAL FOCUS                                         *opencode.nvim-focus*
+7. HEALTH                                               *opencode.nvim-health*
 
-The TUI renders both areas, but input routing records two logical regions:
-`composer` and `session`.
-
->lua
-  local opencode = require("opencode")
-  opencode.focus_input()
-  opencode.focus_session()
-  opencode.focus_next()
-  opencode.get_focus()       -- "composer" | "session"
-  opencode.get_focus_state() -- { region, saved, active, reason, changes }
-<
-
-Focus changes only through these explicit calls, the configured focus key, or
-leaving/returning to the real OpenCode window. Cursor movement, row numbers,
-scrolling and `j`/`k` never switch regions. Returning to the window restores the
-previous region.
-
-`keymaps.focus_next` defaults to `<Tab>`, but it is skipped when an effective
-OpenCode binding already owns that key, so native Tab/Shift-Tab behavior is
-preserved. Set another key or `false` as needed.
+:checkhealth opencode and :OpenCodeHealth report Neovim/vim.uv availability,
+configuration validity, the OpenCode executable and its --version, and terminal
+process/window state.  No network service is required.
 
 ==============================================================================
-8. PRIMITIVES                                        *opencode.nvim-primitives*
+8. TESTING                                             *opencode.nvim-testing*
 
-Composer primitives translate a small Vim-like vocabulary into the TUI's own
-input operations: `h`, `l`, `j`, `k`, `w`, `b`, `e`, `0`, `^`, `$`, `gg`, `G`,
-`x`, `X`, `D`, `C`, `u`, `<C-r>`, `<C-d>`, `<C-u>`, `<C-f>`, `<C-b>`, page keys,
-`d{motion}` and `c{motion}`. Text objects, registers and macros are not
-implemented.
-
-The same primitive name dispatches by region. For example `line_down` moves the
-composer cursor in the composer region and scrolls the session in the session
-region. Primitives never change the logical region.
-
-Public API:
-
->lua
-  local opencode = require("opencode")
-
-  opencode.primitive("page_down", 2)
-
-  opencode.map_primitive("<C-n>", "page_down")
-  opencode.map_primitive("gl", "line_down", { count = false })
-  opencode.unmap_primitive("gl")
-<
-
-`map_primitive()` installs a Normal-mode mapping in the current terminal buffer
-and forwards `vim.v.count1` unless `opts.count = false`.
-
-==============================================================================
-9. KEYBINDINGS                                        *opencode.nvim-keybindings*
-
-Resolution order:
-
-1. OpenCode V2 TUI defaults.
-2. `keybindings.cli_path`, or
-   `$OPENCODE_CONFIG_DIR/cli.json` / `$XDG_CONFIG_HOME/opencode/cli.json`.
-3. `keybindings.overrides` (always wins).
-4. `keybindings.read_cli = false` skips the file;
-   `keybindings.enabled = false` disables native Normal-mode mappings.
-
-Both `keybinds` and `keybindings` objects are accepted. A string may contain
-comma-separated alternatives; arrays, binding objects and key objects are also
-accepted. `<leader>` expands to the complete configured leader sequence.
-
-Keys that cannot be represented as terminal input are skipped with a
-non-blocking diagnostic. Run `:OpenCodeHealth` to inspect them.
-
-==============================================================================
-10. SELECTION ACTIONS                                *opencode.nvim-selection*
-
-`send_selection()` extracts the Visual selection, formats a Markdown context
-block and pastes it through the terminal channel without submitting.
-
-`question_selection()` opens an editable float. `<C-s>` pastes the question and
-context as one bracketed paste, then sends a separate Enter/Submit event.
-Cancellation sends nothing. Empty questions are rejected. Failure keeps the
-float text when possible; a failed submit after a successful paste asks the user
-to press Enter in the TUI.
-
-Text is never interpreted as TUI shortcuts because it is sent inside a
-bracketed paste. Multiline paste and submit are separate writes. OpenCode owns
-all session state.
-
-==============================================================================
-11. HEALTH                                                  *opencode.nvim-health*
-
-`:checkhealth opencode` and `:OpenCodeHealth` report:
-
-- Neovim and |vim.uv| availability;
-- configuration validity;
-- the OpenCode executable and `--version`;
-- terminal process/window state;
-- effective `cli.json` and keybinding diagnostics.
-
-No network service is required.
-
-==============================================================================
-12. TESTING                                              *opencode.nvim-testing*
-
-Run tests only through the isolated runner:
-
->sh
+Unit tests: >sh
   bash tests/run.sh
-  bash tests/run.sh tests/unit/router
 <
+They run in an isolated headless Neovim with temporary HOME/XDG directories,
+shada and project under /tmp/opencode.  The terminal smoke test starts an
+isolated official TUI with --standalone and stops only that process.
 
-The runner creates temporary HOME, XDG config/data/state/cache, runtime, shada
-and project directories under `/tmp/opencode`. The terminal smoke test starts
-an isolated official OpenCode TUI with `--standalone`, verifies output and PTY input, then
-stops only its own process. It never connects to the user's OpenCode service or
-configuration.
-
-==============================================================================
-13. LIMITATIONS                                      *opencode.nvim-limitations*
-
-- One embedded TUI per Neovim instance.
-- Logical focus is an input-routing abstraction; OpenCode renders both regions
-  in one terminal.
-- TUI dialogs, permissions, session selection and completion belong to
-  OpenCode.
-- Modified-key support depends on the terminal and OpenCode input protocol.
-- Selection submission does not wait for agent completion.
+Real tmux end-to-end check: >sh
+  python3 tests/e2e/tmux_e2e.py
+<
+It uses a private tmux socket and isolated Neovim/OpenCode state.  It verifies
+native Alt input, native leader combinations, real TUI cursor movement, text
+despite a global `t jk` mapping, hide/reveal returning to Terminal mode,
+explicit Ctrl-\ Ctrl-n returning to Terminal mode, and remembered vertical
+width across close/open.
 
 vim:tw=78:ts=8:noet:ft=help:norl:

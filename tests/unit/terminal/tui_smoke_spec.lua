@@ -27,7 +27,7 @@ test.describe("real OpenCode TUI smoke", function()
         cwd = dir,
         project = {},
         session = {},
-        window = { layout = "right", size = 80, start_insert = false },
+        window = { layout = "right", size = 80 },
         paste = { bracketed = true, ready_delay = 0, submit_delay = 0 },
       },
       env = { TERM = "xterm-256color" },

@@ -1,74 +1,52 @@
-# opencode.nvim final architecture
+# Final architecture
 
-## Goal
+`opencode.nvim` is a terminal host for the official OpenCode TUI.  OpenCode
+owns rendering, text input, keybindings, the leader, Alt keys, dialogs,
+selection, completion, session navigation and the viewport.  The plugin does
+not build a second input layer or chat UI.
 
-Host the official `opencode` TUI in a Neovim terminal. OpenCode owns rendering,
-the composer, dialog state and the session viewport. The plugin owns process
-lifecycle, terminal input routing, logical focus, selection injection and
-health checks.
-
-## Module map
+## Modules
 
 | Module | Responsibility |
 | --- | --- |
-| `lua/opencode/init.lua` | Public facade, setup/teardown, global keymaps, commands and autocmds. |
-| `lua/opencode/terminal.lua` | Command construction, PTY lifecycle, split window, hide/show/stop, terminal channel. |
-| `lua/opencode/channel.lua` | Fake channel used by tests; production channels come from `terminal:channel()`. |
-| `lua/opencode/router.lua` | Buffer-local Normal-mode mapping plan and execution. |
-| `lua/opencode/primitives.lua` | Vim-like composer/session primitives mapped to TUI input bytes. |
-| `lua/opencode/focus.lua` | Logical composer/session region state. |
-| `lua/opencode/keybindings/defaults.lua` | OpenCode V2 native keybinding defaults. |
-| `lua/opencode/keybindings/init.lua` | Effective cli.json resolution and diagnostics. |
-| `lua/opencode/keybindings/key.lua` | OpenCode/Neovim key syntax parser. |
-| `lua/opencode/keybindings/encode.lua` | Terminal PTY byte encoder. |
-| `lua/opencode/actions/selection.lua` | Visual selection extraction and TUI composer injection. |
-| `lua/opencode/context.lua` | Pure selection capture and Markdown formatting. |
-| `lua/opencode/config.lua` | Defaults, merge and validation. |
-| `lua/opencode/health.lua` | `:checkhealth` and `:OpenCodeHealth` source. |
+| `lua/opencode/init.lua` | Public facade, global keymaps/commands, Terminal-mode enforcement, runtime assembly. |
+| `lua/opencode/terminal.lua` | PTY lifecycle, window visibility, paste/submit, session width memory. |
+| `lua/opencode/config.lua` | Option merge and validation. |
+| `lua/opencode/actions/selection.lua` | `<leader>os` / `<leader>oq` paste and question float. |
+| `lua/opencode/context.lua` | Visual selection extraction and Markdown formatting. |
+| `lua/opencode/health.lua` | Health report without network access. |
+| `lua/opencode/channel.lua` | Test double for terminal writes. |
 
-## Terminal contract
+## Input
 
-- `terminal:open(opts)` starts `opencode` with directory/session/continue/prompt
-  arguments or reveals the existing window.
-- `terminal:close()` hides the window without stopping the job.
-- `terminal:stop()` terminates only this plugin's job and deletes its buffer.
-- `terminal:channel()` returns `send`, `paste`, `submit` and `is_alive`.
-- `paste()` sends bracketed paste (with CR normalization and terminator
-  sanitizing); `submit()` sends a distinct Enter. They are never combined into
-  one write by the selection actions.
+- The OpenCode window is kept in Terminal mode whenever it is focused.
+- `WinEnter`, `BufEnter`, `BufWinEnter` and `ModeChanged` re-enter Terminal mode.
+- Global Terminal-mode mappings are shadowed in the OpenCode buffer with a raw
+  byte forward so they cannot steal text from the TUI.
+- There is no Normal-mode router, logical composer/session region, leader
+  pending state, command table, Visual emulation, cursor synchronization or
+  click emulation.
 
-## Input contract
+## Window lifecycle
 
-- Insert mode has no plugin mappings.
-- Normal mode mappings are buffer-local.
-- Native OpenCode bindings come first and are encoded to PTY bytes.
-- Composer primitives are installed only when no native binding owns the key.
-- Unbound printable/special keys are forwarded.
-- No global `on_key` hook and no screen-row inference.
+- One terminal buffer and one window per embedded TUI.
+- `close()` hides the window; the process keeps running.
+- `stop()` terminates only the job started by this plugin.
+- Vertical layouts remember the last actual window width for the current
+  Neovim session and restore it on reopen, clamped to the current columns.
+- Horizontal layouts use the configured size.
 
-## Focus contract
+## Selection
 
-- Regions: `composer`, `session`.
-- Explicit APIs: `focus_input`, `focus_session`, `focus_next`, `get_focus`,
-  `get_focus_state`.
-- Window leave stores the region; window enter restores it.
-- Motion/page/first/last primitives never change the region.
+- `<leader>os` opens/focuses the terminal, pastes formatted context and never
+  submits.
+- `<leader>oq` uses a real Neovim float, then pastes and sends a separate Enter.
+- Paste is bracketed and sanitized; no shortcut interpretation.
 
-## Selection contract
+## Tests
 
-- `send_selection` pastes formatted context and never submits.
-- `question_selection` uses a real float; submit pastes question + context and
-  then sends a separate submit event.
-- No HTTP client, session controller or plugin-owned session ID.
-- Tests inject a fake terminal channel.
-
-## Verification
-
-```sh
-bash tests/run.sh
-```
-
-The suite covers configuration, focus, key resolution/encoding, router plans and
-buffer mappings, primitives, selection actions, terminal lifecycle and an
-isolated real OpenCode TUI smoke test. All environments live under
-`/tmp/opencode`.
+Unit tests cover configuration, facade lifecycle, terminal paste/submit and
+width memory, selection formatting/actions and TUI smoke.  A separate tmux
+end-to-end script drives an isolated Neovim + official standalone TUI and
+verifies native Alt/leader input, real TUI cursor movement, hide/reveal and the
+Terminal-mode invariant.

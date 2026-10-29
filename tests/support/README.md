@@ -7,7 +7,7 @@ runner and harness have no external dependencies beyond Neovim 0.10+.
 
 ```sh
 bash tests/run.sh                                  # tests/unit/**/*_spec.lua
-bash tests/run.sh tests/unit/router                # a directory
+bash tests/run.sh tests/unit/terminal              # a directory
 bash tests/run.sh tests/unit/config/config_spec.lua
 ```
 

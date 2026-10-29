@@ -23,13 +23,6 @@ local function current_config()
   return config_or_error
 end
 
-local function normalize_level(level)
-  if level == "ok" or level == "info" or level == "warn" or level == "error" then
-    return level
-  end
-  return "info"
-end
-
 local function executable(config)
   local cmd = config and config.cmd or "opencode"
   if type(cmd) == "table" then
@@ -54,51 +47,6 @@ local function cli_version(bin)
     return nil, "empty version output"
   end
   return line
-end
-
-local function keybinding_results(config)
-  local results = {}
-  if not (config.keybindings and config.keybindings.enabled) then
-    results[1] = { level = "info", message = "keybindings: OpenCode keybindings are disabled" }
-    return results
-  end
-  local opts = {
-    read_cli = config.keybindings.read_cli,
-    overrides = config.keybindings.overrides,
-    sequence_timeout = config.keybindings.sequence_timeout,
-  }
-  if config.keybindings.cli_path ~= nil then
-    opts.cli_path = config.keybindings.cli_path
-  end
-  local ok, resolved = pcall(require("opencode.keybindings").resolve, opts)
-  if not ok then
-    results[1] = {
-      level = "warn",
-      message = "keybindings: cannot resolve OpenCode keybindings: " .. tostring(resolved),
-    }
-    return results
-  end
-  for _, item in ipairs(resolved.diagnostics or {}) do
-    results[#results + 1] = {
-      level = normalize_level(item.level),
-      message = "keybindings: " .. tostring(item.message),
-    }
-  end
-  if #results == 0 then
-    results[1] = { level = "ok", message = "keybindings: OpenCode keybindings resolved" }
-  end
-  if resolved.cli and resolved.cli.loaded then
-    results[#results + 1] = {
-      level = "ok",
-      message = "keybindings: loaded " .. tostring(resolved.cli.path),
-    }
-  elseif resolved.cli and resolved.cli.path then
-    results[#results + 1] = {
-      level = "info",
-      message = "keybindings: no cli.json at " .. tostring(resolved.cli.path) .. " (native defaults used)",
-    }
-  end
-  return results
 end
 
 --- Collect health results without touching user services.
@@ -199,7 +147,6 @@ function M.collect(rt)
     end
   end
 
-  vim.list_extend(results, keybinding_results(config))
   return results
 end
 

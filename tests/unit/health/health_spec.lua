@@ -81,30 +81,6 @@ test.describe("health", function()
     test.matches("TUI is not running", messages(stopped))
   end)
 
-  test.it("surfaces keybinding warnings exactly once in public health()", function()
-    pcall(function()
-      require("opencode").stop()
-    end)
-    test.reload()
-    local opencode = require("opencode")
-    opencode.setup({
-      cmd = "sh",
-      keybindings = {
-        read_cli = false,
-        overrides = { session_interrupt = "hyper+x" },
-      },
-    })
-    local results = opencode.health()
-    local warnings = 0
-    for _, item in ipairs(results) do
-      if item.level == "warn" and item.message:find("hyper", 1, true) then
-        warnings = warnings + 1
-      end
-    end
-    test.equal(1, warnings)
-    pcall(opencode.stop)
-  end)
-
   test.it("check() runs in headless Neovim", function()
     local ok, err, output = capture_health(function()
       health.check()
