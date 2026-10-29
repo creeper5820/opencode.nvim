@@ -1,29 +1,16 @@
--- Visual selection actions.
+-- Visual selection actions for the embedded TUI.
 --
--- Two entry points share the exact same context extraction/formatting:
+-- Both entry points use the same context extraction/formatting module.  They
+-- interact with OpenCode only through a terminal channel: no HTTP session
+-- controller, session ID or server-side prompt API is involved.
 --
---   actions.send_selection()      append to the sidebar draft, never submit
---   actions.question_selection()  open a real editable float, prompt on <C-s>
+--   send_selection()      paste formatted context into the TUI composer
+--   question_selection()  open a real Vim float; on submit paste question +
+--                         context, then send a separate Enter/Submit event
 --
--- The module never touches the HTTP client, session ids or SSE.  A question is
--- submitted through the 05A contract `session.prompt(text, callback)`, where a
--- callback with no error means the server accepted the prompt.  Acceptance
--- closes the float immediately; Agent execution is deliberately not awaited.
---
--- Dependencies can be replaced for tests and by the task-10 wiring:
---
---   actions.setup({
---     ui = require("opencode.ui"),
---     session = require("opencode.session"),
---     submit_key = "<C-s>",
---     notify = function(message, level) vim.notify(message, level) end,
---     float = { width = 64, height = 8, border = "rounded" },
---   })
---
--- `send_selection(opts)`/`question_selection(opts)` also accept per-call
--- `ui`, `session`, `notify`, `selection` and `buffer` fields.  Passing a
--- `selection` table is useful for tests and for callers that captured a
--- snapshot before leaving Visual mode.
+-- Bracketed paste keeps ordinary text (including text beginning with "/", ":",
+-- or a key-like word) from being interpreted as TUI shortcuts.  Tests inject
+-- `opencode.channel.new({})` as `opts.channel` or via setup().
 
 local context = require("opencode.context")
 
@@ -32,6 +19,8 @@ local M = {}
 local defaults = {
   submit_key = "<C-s>",
   cancel_key = "<Esc>",
+  submit_delay = nil,
+  paste = { bracketed = true },
   float = {
     width = 64,
     height = 8,
@@ -41,12 +30,15 @@ local defaults = {
 }
 
 local state = {
-  ui = nil,
-  session = nil,
+  channel = nil,
+  focus_input = nil,
+  open = nil,
   notify = nil,
   on_question = nil,
   submit_key = defaults.submit_key,
   cancel_key = defaults.cancel_key,
+  submit_delay = defaults.submit_delay,
+  paste = vim.deepcopy(defaults.paste),
   float = vim.deepcopy(defaults.float),
   question = nil,
   last_question = nil,
@@ -68,10 +60,16 @@ local function default_notify(message, level)
 end
 
 local function emit(notifier, message, level)
-  if notifier == false then
+  local fn = notifier
+  if fn == nil then
+    fn = state.notify
+  end
+  if fn == nil then
+    fn = default_notify
+  end
+  if fn == false then
     return
   end
-  local fn = notifier or state.notify or default_notify
   local ok = pcall(fn, message, level or vim.log.levels.ERROR)
   if not ok and fn ~= default_notify then
     pcall(default_notify, message, level or vim.log.levels.ERROR)
@@ -101,10 +99,6 @@ local function pick(value, fallback)
   return fallback
 end
 
--- Dependencies use both styles in this project: opencode.ui exposes plain
--- functions while a 05A controller instance exposes methods.  Pick the style
--- from the function arity so both the frozen `session.prompt(text, callback)`
--- facade and an injected controller work without wrappers.
 local function call_dependency(object, name, ...)
   local fn = object[name]
   local argc = select("#", ...)
@@ -115,41 +109,6 @@ local function call_dependency(object, name, ...)
   return fn(...)
 end
 
-local function resolve_ui(value)
-  local ui = pick(value, state.ui)
-  if ui == nil then
-    local ok, module = pcall(require, "opencode.ui")
-    if not ok or type(module) ~= "table" then
-      return nil, "opencode.ui is not available"
-    end
-    ui = module
-  end
-  if type(ui) ~= "table" then
-    return nil, "opencode.ui must be a table"
-  end
-  return ui
-end
-
-local function resolve_session(value)
-  local session = pick(value, state.session)
-  if session == nil then
-    local ok, module = pcall(require, "opencode.session")
-    if not ok or type(module) ~= "table" then
-      return nil, "opencode.session is not available"
-    end
-    session = module
-  end
-  if type(session) ~= "table" then
-    return nil, "opencode.session must be a table"
-  end
-  if type(session.prompt) ~= "function" then
-    return nil, "opencode.session.prompt is not available"
-  end
-  return session
-end
-
--- Accept either an options table or a bare selection/context table.  The
--- latter keeps direct calls from mappings and tests concise.
 local function normalize_options(opts)
   if type(opts) ~= "table" then
     return opts
@@ -222,6 +181,74 @@ local function format_context(selection_context)
   return formatted
 end
 
+local function resolve_channel(opts)
+  local channel = pick(opts.channel, state.channel)
+  if type(channel) == "function" then
+    local ok, value = pcall(channel)
+    channel = ok and value or nil
+  end
+  if channel == nil then
+    local opener = pick(opts.open, state.open)
+    if opener ~= false then
+      if type(opener) == "function" then
+        pcall(opener)
+      else
+        local ok, module = pcall(require, "opencode")
+        if ok and type(module) == "table" and type(module.open) == "function" then
+          pcall(module.open)
+        end
+      end
+    end
+    local ok, module = pcall(require, "opencode")
+    if ok and type(module) == "table" and type(module.channel) == "function" then
+      local channel_ok, live = pcall(module.channel)
+      if channel_ok then
+        channel = live
+      end
+    end
+  end
+  if type(channel) ~= "table" then
+    return nil, "OpenCode terminal is not available"
+  end
+  if type(channel.paste) ~= "function" then
+    return nil, "terminal channel cannot paste"
+  end
+  if type(channel.submit) ~= "function" then
+    return nil, "terminal channel cannot submit"
+  end
+  if type(channel.is_alive) == "function" then
+    local ok, alive = pcall(channel.is_alive, channel)
+    if not ok or not alive then
+      return nil, "OpenCode terminal is not running"
+    end
+  end
+  return channel
+end
+
+local function focus_composer(opts)
+  local focus = pick(opts.focus_input, state.focus_input)
+  if focus == false then
+    return true
+  end
+  if type(focus) == "function" then
+    pcall(focus)
+    return true
+  end
+  local ok, module = pcall(require, "opencode")
+  if ok and type(module) == "table" and type(module.focus_input) == "function" then
+    pcall(module.focus_input)
+  end
+  return true
+end
+
+local function paste_opts(opts)
+  local value = pick(opts.paste, state.paste)
+  if type(value) ~= "table" then
+    return { bracketed = true }
+  end
+  return value
+end
+
 local function close_float(qstate)
   if qstate == nil then
     return
@@ -240,8 +267,6 @@ local function close_float(qstate)
 end
 
 local function open_float(selection_context, formatted, opts)
-  -- Opening another question never leaves the previous float, buffer or
-  -- buffer-local mappings behind.
   if state.question ~= nil then
     close_float(state.question)
   end
@@ -278,8 +303,6 @@ local function open_float(selection_context, formatted, opts)
 
   local win_ok, win = pcall(vim.api.nvim_open_win, buf, true, win_config)
   if not win_ok and win_config.title ~= nil then
-    -- Older Neovim versions do not support float titles; functionality is
-    -- more important than the title.
     win_config.title = nil
     win_config.title_pos = nil
     win_ok, win = pcall(vim.api.nvim_open_win, buf, true, win_config)
@@ -303,9 +326,12 @@ local function open_float(selection_context, formatted, opts)
     win = win,
     context = selection_context,
     formatted = formatted,
-    ui = opts.ui,
-    session = opts.session,
+    channel = opts.channel,
+    focus_input = opts.focus_input,
+    open = opts.open,
     notifier = opts.notify,
+    paste = opts.paste,
+    submit_delay = opts.submit_delay,
     submitting = false,
     finished = false,
     closed = false,
@@ -348,14 +374,11 @@ local function open_float(selection_context, formatted, opts)
   end
 
   state.question = qstate
-  -- The float is a prompt: start in Insert mode but keep all native editing
-  -- (including Enter and the Esc mode switch) intact.
   pcall(vim.cmd, "startinsert")
   return qstate
 end
 
---- Append the formatted selection to the sidebar draft and focus the input.
---- Never calls session.prompt, ui.submit or ui.on_submit.
+--- Paste the formatted selection into the TUI composer.  Never submits.
 --- @param opts table|nil
 --- @return boolean ok
 --- @return string|nil error
@@ -379,40 +402,24 @@ function M.send_selection(opts)
     return false, format_error
   end
 
-  local ui, ui_error = resolve_ui(opts.ui)
-  if not ui then
-    emit(notifier, "OpenCode: " .. tostring(ui_error), vim.log.levels.ERROR)
-    return false, ui_error
-  end
-  if type(ui.append_draft) ~= "function" then
-    local message = "opencode.ui.append_draft is not available"
-    emit(notifier, "OpenCode: " .. message, vim.log.levels.ERROR)
-    return false, message
+  local channel, channel_error = resolve_channel(opts)
+  if not channel then
+    emit(notifier, "OpenCode: " .. tostring(channel_error), vim.log.levels.ERROR)
+    return false, channel_error
   end
 
-  local append_ok, append_error = pcall(call_dependency, ui, "append_draft", formatted)
-  if not append_ok then
-    local message = "cannot append selection to draft: " .. tostring(append_error)
+  focus_composer(opts)
+  local ok, err = channel:paste(formatted, paste_opts(opts))
+  if not ok then
+    local message = "cannot write selection to OpenCode composer: " .. error_message(err)
     emit(notifier, "OpenCode: " .. message, vim.log.levels.ERROR)
     return false, message
   end
   state.last_appended = formatted
-
-  local open_ok, open_error = pcall(call_dependency, ui, "open")
-  if not open_ok then
-    local message = "cannot open sidebar: " .. tostring(open_error)
-    emit(notifier, "OpenCode: " .. message, vim.log.levels.ERROR)
-    return false, message
-  end
-  if type(ui.focus_input) == "function" then
-    pcall(call_dependency, ui, "focus_input")
-  end
   return true
 end
 
 --- Capture a selection snapshot and open the editable question float.
---- The snapshot is stored in the float state, so later buffer/selection edits
---- cannot change what will be sent.
 --- @param opts table|nil
 --- @return boolean ok
 --- @return table|string float state or error
@@ -444,10 +451,8 @@ function M.question_selection(opts)
   return true, qstate
 end
 
---- Submit the current float content.  Empty/whitespace-only questions are
---- ignored, duplicate submissions are rejected while one is pending, and
---- failures keep the float and its text for retry.
---- @param qstate table|nil Internal float state (defaults to the open float).
+--- Submit the open question through the terminal channel.
+--- @param qstate table|nil
 --- @return boolean started
 function M._submit_question(qstate)
   if type(qstate) ~= "table" then
@@ -483,79 +488,64 @@ function M._submit_question(qstate)
   qstate.prompt = prompt
   qstate.error = nil
 
-  local session, session_error = resolve_session(qstate.session)
-  if not session then
-    qstate.error = { code = "session_unavailable", message = tostring(session_error) }
-    emit(qstate.notifier, "OpenCode question failed: " .. tostring(session_error), vim.log.levels.ERROR)
+  local channel, channel_error = resolve_channel(qstate)
+  if not channel then
+    qstate.error = { code = "terminal_unavailable", message = tostring(channel_error) }
+    emit(qstate.notifier, "OpenCode question failed: " .. tostring(channel_error), vim.log.levels.ERROR)
     return false
   end
 
   qstate.submitting = true
-  local completed = false
+  focus_composer(qstate)
 
-  local function done(err)
-    if completed then
-      return
-    end
-    completed = true
-    if state.question ~= qstate then
-      return
-    end
+  local paste_ok, paste_error = channel:paste(prompt, paste_opts(qstate))
+  if not paste_ok then
     qstate.submitting = false
-
-    if err ~= nil and err ~= false then
-      qstate.error = err
-      emit(
-        qstate.notifier,
-        "OpenCode question failed: " .. error_message(err),
-        vim.log.levels.ERROR
-      )
-      return
-    end
-
-    qstate.finished = true
-    local question_text = qstate.question
-    local prompt_text = qstate.prompt
-    local context_snapshot = qstate.context
-    close_float(qstate)
-
-    state.last_question = question_text
-    state.last_prompt = prompt_text
-    state.last_context = context_snapshot
-    if type(state.on_question) == "function" then
-      pcall(state.on_question, question_text, prompt_text, context_snapshot)
-    end
-
-    local ui, ui_error = resolve_ui(qstate.ui)
-    if not ui then
-      emit(qstate.notifier, "OpenCode: " .. tostring(ui_error), vim.log.levels.ERROR)
-      return
-    end
-    local open_ok, open_error = pcall(call_dependency, ui, "open")
-    if not open_ok then
-      emit(
-        qstate.notifier,
-        "OpenCode: cannot open sidebar: " .. tostring(open_error),
-        vim.log.levels.ERROR
-      )
-      return
-    end
-    if type(ui.focus_input) == "function" then
-      pcall(call_dependency, ui, "focus_input")
-    end
+    qstate.error = { code = "paste_failed", message = error_message(paste_error) }
+    emit(qstate.notifier, "OpenCode question failed: " .. error_message(paste_error), vim.log.levels.ERROR)
+    return false
   end
 
-  local prompt_ok, prompt_error = pcall(call_dependency, session, "prompt", prompt, done)
-  if not prompt_ok and not completed then
-    done(prompt_error)
+  local submit_ok, submit_error = channel:submit({
+    delay = pick(qstate.submit_delay, state.submit_delay),
+  })
+  if not submit_ok then
+    -- The text is already in the TUI; keep it there and ask the user to press
+    -- Enter manually instead of silently duplicating it on retry.
+    qstate.finished = true
+    qstate.submitting = false
+    qstate.error = { code = "submit_failed", message = error_message(submit_error) }
+    close_float(qstate)
+    emit(
+      qstate.notifier,
+      "OpenCode: prompt was pasted but submit failed ("
+        .. error_message(submit_error)
+        .. "); press Enter in OpenCode",
+      vim.log.levels.ERROR
+    )
+    return false
+  end
+
+  qstate.finished = true
+  qstate.submitting = false
+  local question_text = qstate.question
+  local prompt_text = qstate.prompt
+  local context_snapshot = qstate.context
+  close_float(qstate)
+
+  state.last_question = question_text
+  state.last_prompt = prompt_text
+  state.last_context = context_snapshot
+  if type(state.on_question) == "function" then
+    pcall(state.on_question, question_text, prompt_text, context_snapshot)
   end
   return true
 end
 
 M.submit_question = M._submit_question
 
---- Cancel the open question without submitting anything.
---- @param qstate table|nil Internal float state (defaults to the open float).
+--- Cancel the open question without sending anything.
+--- @param qstate table|nil
 --- @return boolean cancelled
 function M.cancel_question(qstate)
   if type(qstate) ~= "table" then
@@ -573,7 +563,6 @@ function M.is_question_open()
   return qstate ~= nil and valid_win(qstate.win) and valid_buf(qstate.buf)
 end
 
---- Inspectable state for tests and status integrations.
 --- @return table
 function M.get_question_state()
   local qstate = state.question
@@ -618,11 +607,16 @@ function M.setup(opts)
     close_float(state.question)
   end
 
-  if opts.ui ~= nil then
-    state.ui = opts.ui
+  if opts.channel ~= nil then
+    state.channel = opts.channel
   end
-  if opts.session ~= nil then
-    state.session = opts.session
+  if opts.focus_input ~= nil then
+    assert(opts.focus_input == false or type(opts.focus_input) == "function", "focus_input must be a function or false")
+    state.focus_input = opts.focus_input
+  end
+  if opts.open ~= nil then
+    assert(opts.open == false or type(opts.open) == "function", "open must be a function or false")
+    state.open = opts.open
   end
   if opts.notify ~= nil then
     assert(type(opts.notify) == "function" or opts.notify == false, "notify must be a function or false")
@@ -646,6 +640,14 @@ function M.setup(opts)
     )
     state.cancel_key = opts.cancel_key
   end
+  if opts.submit_delay ~= nil then
+    assert(type(opts.submit_delay) == "number" and opts.submit_delay >= 0, "submit_delay must be a non-negative number")
+    state.submit_delay = opts.submit_delay
+  end
+  if opts.paste ~= nil then
+    assert(type(opts.paste) == "table", "paste must be a table")
+    state.paste = vim.tbl_deep_extend("force", vim.deepcopy(defaults.paste), opts.paste)
+  end
   if opts.float ~= nil then
     assert(type(opts.float) == "table", "float must be a table")
     state.float = vim.tbl_deep_extend("force", vim.deepcopy(defaults.float), opts.float)
@@ -658,12 +660,15 @@ function M._reset()
   if state.question ~= nil then
     close_float(state.question)
   end
-  state.ui = nil
-  state.session = nil
+  state.channel = nil
+  state.focus_input = nil
+  state.open = nil
   state.notify = nil
   state.on_question = nil
   state.submit_key = defaults.submit_key
   state.cancel_key = defaults.cancel_key
+  state.submit_delay = defaults.submit_delay
+  state.paste = vim.deepcopy(defaults.paste)
   state.float = vim.deepcopy(defaults.float)
   state.question = nil
   state.last_question = nil

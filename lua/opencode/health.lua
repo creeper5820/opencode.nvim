@@ -30,53 +30,55 @@ local function normalize_level(level)
   return "info"
 end
 
---- Collect keybinding diagnostics without re-entering the public health facade.
---- The keybindings module is optional: if it is absent, report info, never an
---- error.  `opencode.keybindings.health()` reads the same configuration keys as
---- the runtime attachment path and returns `{ level, code, message }` entries.
---- @param config table|nil resolved configuration; fetched when omitted
---- @return table[] list of { level = "ok"|"warn"|"error"|"info", message = string }
-function M.collect_keybindings(config)
+local function executable(config)
+  local cmd = config and config.cmd or "opencode"
+  if type(cmd) == "table" then
+    return cmd[1]
+  end
+  return cmd
+end
+
+local function cli_version(bin)
+  if type(bin) ~= "string" or bin == "" then
+    return nil, "cmd is empty"
+  end
+  local ok, output = pcall(vim.fn.system, { bin, "--version" })
+  if not ok then
+    return nil, tostring(output)
+  end
+  if vim.v.shell_error ~= 0 then
+    return nil, ("%s --version exited with %d"):format(bin, vim.v.shell_error)
+  end
+  local line = tostring(output):match("^%s*([^\r\n]+)")
+  if not line or line == "" then
+    return nil, "empty version output"
+  end
+  return line
+end
+
+local function keybinding_results(config)
   local results = {}
-  local module_ok, keybindings = pcall(require, "opencode.keybindings")
-  if not module_ok or type(keybindings) ~= "table" then
-    results[1] = { level = "info", message = "OpenCode semantic keybindings are not installed" }
+  if not (config.keybindings and config.keybindings.enabled) then
+    results[1] = { level = "info", message = "keybindings: OpenCode keybindings are disabled" }
     return results
   end
-
-  if type(config) ~= "table" then
-    config = current_config()
+  local opts = {
+    read_cli = config.keybindings.read_cli,
+    overrides = config.keybindings.overrides,
+    sequence_timeout = config.keybindings.sequence_timeout,
+  }
+  if config.keybindings.cli_path ~= nil then
+    opts.cli_path = config.keybindings.cli_path
   end
-  if type(config) ~= "table" then
-    results[1] = { level = "info", message = "OpenCode semantic keybindings are not configured" }
-    return results
-  end
-
-  local keybindings_config = config.keybindings
-  if type(keybindings_config) ~= "table" then
-    results[1] = { level = "info", message = "OpenCode semantic keybindings are not configured" }
-    return results
-  end
-  if not keybindings_config.enabled then
-    results[1] = { level = "info", message = "OpenCode semantic keybindings are disabled" }
-    return results
-  end
-
-  local ok, diagnostics = pcall(keybindings.health, {
-    cli_path = keybindings_config.cli_path,
-    read_cli = keybindings_config.read_cli,
-    overrides = keybindings_config.overrides,
-    sequence_timeout = keybindings_config.sequence_timeout,
-  })
+  local ok, resolved = pcall(require("opencode.keybindings").resolve, opts)
   if not ok then
     results[1] = {
       level = "warn",
-      message = "cannot resolve OpenCode keybindings: " .. tostring(diagnostics),
+      message = "keybindings: cannot resolve OpenCode keybindings: " .. tostring(resolved),
     }
     return results
   end
-
-  for _, item in ipairs(diagnostics or {}) do
+  for _, item in ipairs(resolved.diagnostics or {}) do
     results[#results + 1] = {
       level = normalize_level(item.level),
       message = "keybindings: " .. tostring(item.message),
@@ -85,14 +87,24 @@ function M.collect_keybindings(config)
   if #results == 0 then
     results[1] = { level = "ok", message = "keybindings: OpenCode keybindings resolved" }
   end
+  if resolved.cli and resolved.cli.loaded then
+    results[#results + 1] = {
+      level = "ok",
+      message = "keybindings: loaded " .. tostring(resolved.cli.path),
+    }
+  elseif resolved.cli and resolved.cli.path then
+    results[#results + 1] = {
+      level = "info",
+      message = "keybindings: no cli.json at " .. tostring(resolved.cli.path) .. " (native defaults used)",
+    }
+  end
   return results
 end
 
---- Collect core health results without touching buffers. Exposed for tests.
---- Keybinding diagnostics are kept separate so `require("opencode").health()`
---- can continue appending them without duplicating them.
---- @return table[] list of { level = "ok"|"warn"|"error"|"info", message = string }
-function M.collect()
+--- Collect health results without touching user services.
+--- @param rt table|nil Assembled runtime; fetched lazily when omitted.
+--- @return table[] list of { level, message }
+function M.collect(rt)
   local results = {}
   local version = vim.version()
   local current = { version.major, version.minor, version.patch }
@@ -116,37 +128,84 @@ function M.collect()
     }
   end
 
-  local config, config_error = current_config()
-  if config == nil then
-    results[#results + 1] = {
-      level = "error",
-      message = "configuration is invalid: " .. tostring(config_error),
-    }
-    return results
+  local config
+  if rt and rt.config then
+    config = rt.config
+  else
+    local config_error
+    config, config_error = current_config()
+    if config == nil then
+      results[#results + 1] = {
+        level = "error",
+        message = "configuration is invalid: " .. tostring(config_error),
+      }
+      return results
+    end
   end
 
   results[#results + 1] = { level = "ok", message = "configuration is valid" }
-  local url = config.server.url
-  results[#results + 1] = { level = "info", message = "server.url = " .. url }
 
-  if url:lower():match("^https://") then
+  local bin = executable(config)
+  if type(bin) ~= "string" or bin == "" then
+    results[#results + 1] = { level = "error", message = "cmd does not name an executable" }
+  elseif vim.fn.executable(bin) ~= 1 then
     results[#results + 1] = {
       level = "error",
-      message = "HTTPS server URLs are not supported yet; use an http:// URL",
+      message = ('OpenCode executable "%s" is not executable or not on PATH'):format(bin),
     }
+  else
+    results[#results + 1] = { level = "ok", message = 'OpenCode executable: ' .. bin }
+    local cli, cli_error = cli_version(bin)
+    if cli then
+      results[#results + 1] = { level = "ok", message = "OpenCode " .. cli }
+    else
+      results[#results + 1] = {
+        level = "warn",
+        message = "cannot run " .. bin .. " --version: " .. tostring(cli_error),
+      }
+    end
   end
 
+  if rt and rt.terminal then
+    local state = rt.terminal:get_state()
+    if state.running then
+      results[#results + 1] = {
+        level = "ok",
+        message = ("TUI running (pid %s) in %s"):format(tostring(state.pid), tostring(state.cwd)),
+      }
+      results[#results + 1] = {
+        level = state.open and "ok" or "info",
+        message = state.open and "TUI window is visible" or "TUI window is hidden (process stays alive)",
+      }
+    else
+      results[#results + 1] = { level = "info", message = "TUI is not running" }
+    end
+  elseif rt == nil then
+    local ok, opencode = pcall(require, "opencode")
+    if ok and type(opencode) == "table" and type(opencode.get_state) == "function" then
+      local state_ok, state = pcall(opencode.get_state)
+      if state_ok and type(state) == "table" and state.terminal then
+        if state.terminal.running then
+          results[#results + 1] = {
+            level = "ok",
+            message = ("TUI running (pid %s) in %s"):format(
+              tostring(state.terminal.pid), tostring(state.terminal.cwd)
+            ),
+          }
+        else
+          results[#results + 1] = { level = "info", message = "TUI is not running" }
+        end
+      end
+    end
+  end
+
+  vim.list_extend(results, keybinding_results(config))
   return results
 end
 
 function M.check()
   vim.health.start("opencode.nvim")
-  local results = M.collect()
-  local config = current_config()
-  if config ~= nil then
-    vim.list_extend(results, M.collect_keybindings(config))
-  end
-  for _, result in ipairs(results) do
+  for _, result in ipairs(M.collect(nil)) do
     if result.level == "ok" then
       vim.health.ok(result.message)
     elseif result.level == "warn" then

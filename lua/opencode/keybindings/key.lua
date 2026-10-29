@@ -460,12 +460,16 @@ local function key_object_stroke(value)
     return nil, ("unsupported key name %q"):format(value.name)
   end
   local flags = {}
-  for _, field in ipairs({ "ctrl", "shift", "meta", "super", "hyper" }) do
+  for _, field in ipairs({ "ctrl", "control", "shift", "meta", "alt", "super", "hyper" }) do
     if value[field] ~= nil and type(value[field]) ~= "boolean" then
       return nil, ("key object field %q must be a boolean"):format(field)
     end
-    flags[field] = value[field] == true
   end
+  flags.ctrl = value.ctrl == true or value.control == true
+  flags.shift = value.shift == true
+  flags.meta = value.meta == true or value.alt == true
+  flags.super = value.super == true
+  flags.hyper = value.hyper == true
   return new_stroke(name, flags)
 end
 

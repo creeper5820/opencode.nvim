@@ -1,55 +1,22 @@
--- OpenCode semantic keybindings.
+-- Effective OpenCode CLI keybindings.
 --
--- Maps OpenCode V2 `cli.json` command IDs to buffer-local Neovim actions.
--- Raw terminal keys are never forwarded to a TUI and no global on_key hook is
--- installed.  The first supported command is `session.interrupt`.
---
--- Public API:
---
---   local keybindings = require("opencode.keybindings")
---   local resolved = keybindings.resolve({ cli_config = ..., overrides = ... })
---   keybindings.attach(buffer, {
---     actions = { ["session.interrupt"] = function() ... end },
---     cli_config = ..., overrides = ...,
---   })
---   keybindings.detach(buffer)
---
--- `attach` is buffer-local and idempotent: attaching the same buffer again
--- replaces its old mappings and closes any pending sequence timer.
---
--- Mode policy: `session.interrupt` is registered in Normal mode only.  The
--- first <Esc> in Insert mode is left entirely to Neovim (it exits Insert), and
--- Visual mode is not mapped so a selection is never destroyed by an
--- interrupt.  Only buffers explicitly passed to attach() are touched.
+-- The embedded TUI receives keys directly, so this module no longer maps
+-- command IDs to Lua actions.  It resolves cli.json (defaults + user file +
+-- Neovim overrides) into complete key sequences and encodes them as PTY input
+-- bytes.  The router installs those sequences as buffer-local Normal-mode
+-- mappings in the OpenCode terminal buffer; Insert mode is never mapped.
 
 local key = require("opencode.keybindings.key")
+local encoder = require("opencode.keybindings.encode")
+local defaults = require("opencode.keybindings.defaults")
 
 local M = {}
 
-M.supported = {
-  ["session.interrupt"] = true,
-}
-
-M.command_modes = {
-  ["session.interrupt"] = { "n" },
-}
-
-M.defaults = {
-  leader = "ctrl+x",
-  ["session.interrupt"] = "escape",
-}
+M.defaults = defaults
+M.native_defaults = defaults
 
 local DEFAULT_LEADER_TIMEOUT = 2000
 local DEFAULT_SEQUENCE_TIMEOUT = 1000
-local MAPPING_DESC_PREFIX = "OpenCode: "
-local ALLOWED_MODES = {
-  n = true,
-  i = true,
-  x = true,
-  v = true,
-  o = true,
-  t = true,
-}
 local CONTROL_OVERRIDE_KEYS = {
   keybinds = true,
   leader = true,
@@ -86,6 +53,17 @@ end
 
 local function is_json_array(value)
   return type(value) == "table" and next(value) ~= nil and vim.islist(value)
+end
+
+local function canonical(name)
+  return tostring(name):gsub("%.", "_")
+end
+
+local function alias_for(name)
+  if type(name) ~= "string" or not name:find("_", 1, true) then
+    return nil
+  end
+  return (name:gsub("_", "."))
 end
 
 --- Default global OpenCode CLI configuration path.
@@ -160,12 +138,17 @@ local function is_leader_timing_only(value)
     and value.timeout ~= nil
 end
 
-local function parse_leader(overrides, cli_keybinds, diagnostics)
-  local value = M.defaults.leader
+local function parse_leader(overrides, cli_keybinds, cli, diagnostics)
+  local value = defaults.leader
   local source = "default"
 
-  if cli_keybinds ~= nil and rawget(cli_keybinds, "leader") ~= nil then
+  if type(cli_keybinds) == "table" and rawget(cli_keybinds, "leader") ~= nil then
     value = cli_keybinds.leader
+    source = "cli"
+  elseif type(cli.leader) == "string"
+    or (type(cli.leader) == "table" and not is_leader_timing_only(cli.leader))
+  then
+    value = cli.leader
     source = "cli"
   end
 
@@ -202,10 +185,10 @@ local function parse_leader(overrides, cli_keybinds, diagnostics)
 
   if not ok or not strokes then
     if source ~= "default" then
-      local default_ok, default_strokes, default_diagnostics = pcall(key.parse_leader, M.defaults.leader, {})
+      local default_ok, default_strokes, default_diagnostics = pcall(key.parse_leader, defaults.leader, {})
       if default_ok and default_strokes then
         add_diagnostic(diagnostics, "info", "leader_fallback",
-          ("using the default OpenCode leader %q"):format(M.defaults.leader),
+          ("using the default OpenCode leader %q"):format(defaults.leader),
           { source = source })
         return default_strokes, key.to_lhs(default_strokes), "default", diagnostics
       end
@@ -222,7 +205,7 @@ local function parse_leader(overrides, cli_keybinds, diagnostics)
 end
 
 local function leader_timeout(overrides, cli, diagnostics)
-  local value = DEFAULT_LEADER_TIMEOUT
+  local value = defaults.leader_timeout or DEFAULT_LEADER_TIMEOUT
   local source = "default"
 
   local cli_leader = type(cli.leader) == "table" and cli.leader.timeout or nil
@@ -278,72 +261,61 @@ local function sequence_timeout(opts, overrides)
   return value
 end
 
+local function sorted_keys(table_value)
+  local names = {}
+  for name in pairs(table_value or {}) do
+    names[#names + 1] = name
+  end
+  table.sort(names)
+  return names
+end
+
 local function command_values(cli_keybinds, overrides, diagnostics)
   local values = {}
   local order = {}
+  local originals = {}
 
-  local function put(name, value, source)
+  local function put(name, value, source, original)
     if type(name) ~= "string" or name == "" then
       add_diagnostic(diagnostics, "warn", "invalid_command",
         ("keybind command IDs must be non-empty strings; got %s"):format(type(name)),
         { source = source })
       return
     end
-    if name == "leader" then
+    local normalized = canonical(name)
+    if normalized == "leader" or normalized == "leader_timeout" then
       return
     end
-    if values[name] == nil then
-      order[#order + 1] = name
+    if values[normalized] == nil then
+      order[#order + 1] = normalized
     end
-    values[name] = { value = value, source = source }
+    values[normalized] = { value = value, source = source, original = original or normalized }
+    originals[normalized] = original or normalized
   end
 
-  for name, value in pairs(M.defaults) do
-    if name ~= "leader" then
-      put(name, value, "default")
+  for _, name in ipairs(sorted_keys(defaults)) do
+    if name ~= "leader" and name ~= "leader_timeout" then
+      put(name, defaults[name], "default", name)
     end
   end
 
   if type(cli_keybinds) == "table" then
-    for name, value in pairs(cli_keybinds) do
-      put(name, value, "cli")
+    for _, name in ipairs(sorted_keys(cli_keybinds)) do
+      put(name, cli_keybinds[name], "cli", name)
     end
   end
 
   local override_bindings = override_keybinds(overrides)
   if type(override_bindings) == "table" then
     local nested = type(overrides.keybinds) == "table"
-    for name, value in pairs(override_bindings) do
+    for _, name in ipairs(sorted_keys(override_bindings)) do
       if (nested and name ~= "leader") or (not nested and not is_control_override_key(name)) then
-        put(name, value, "override")
+        put(name, override_bindings[name], "override", name)
       end
     end
   end
 
-  return values, order
-end
-
-local function modes_for(command, opts)
-  if command == "session.interrupt" then
-    return { "n" }
-  end
-  local configured = type(opts.modes) == "table" and opts.modes[command] or nil
-  if type(configured) == "string" then
-    configured = { configured }
-  end
-  if type(configured) ~= "table" then
-    configured = M.command_modes[command] or { "n" }
-  end
-  local modes = {}
-  for _, mode in ipairs(configured) do
-    if type(mode) == "string" and ALLOWED_MODES[mode] then
-      modes[#modes + 1] = mode
-    end
-  end
-  if #modes == 0 then
-    modes = { "n" }
-  end
-  return modes
+  return values, order, originals
 end
 
 --- Resolve OpenCode CLI keybinds and Neovim overrides.
@@ -353,7 +325,6 @@ end
 ---   cli_path: explicit cli.json path
 ---   read_cli: false disables reading the global file
 ---   overrides: flat command -> binding table, or { keybinds = ..., leader = ..., timeout = ... }
----   modes: command -> mode string/list override (session.interrupt is always Normal)
 ---   sequence_timeout: timeout in ms for repeated-key sequences (default: 'timeoutlen')
 --- @return table
 function M.resolve(opts)
@@ -376,7 +347,7 @@ function M.resolve(opts)
     cli, source = read_cli_config(opts.cli_path, diagnostics)
   end
 
-  local cli_keybinds = cli.keybinds
+  local cli_keybinds = cli.keybinds or cli.keybindings
   if cli_keybinds ~= nil and (type(cli_keybinds) ~= "table" or is_json_array(cli_keybinds)) then
     add_diagnostic(diagnostics, "warn", "invalid_keybinds",
       "OpenCode cli.json keybinds must be an object; ignoring it")
@@ -391,7 +362,7 @@ function M.resolve(opts)
   end
 
   local leader_strokes, leader_lhs, leader_source, leader_diagnostics =
-    parse_leader(overrides, cli_keybinds, diagnostics)
+    parse_leader(overrides, cli_keybinds, cli, diagnostics)
   if type(leader_diagnostics) == "table" then
     for _, item in ipairs(leader_diagnostics) do
       if not item.command then
@@ -402,55 +373,64 @@ function M.resolve(opts)
 
   local timeout = leader_timeout(overrides, cli, diagnostics)
   local seq_timeout = sequence_timeout(opts, overrides)
-  local values, order = command_values(cli_keybinds, overrides, diagnostics)
+  local values, order, originals = command_values(cli_keybinds, overrides, diagnostics)
 
   local bindings = {}
-  local seen = {}
-  local all_commands = {}
   for _, name in ipairs(order) do
-    if not seen[name] then
-      seen[name] = true
-      all_commands[#all_commands + 1] = name
-    end
-  end
-
-  for _, command in ipairs(all_commands) do
-    local entry = values[command]
+    local entry = values[name]
     local parsed = key.parse_binding(entry.value, { leader_strokes = leader_strokes })
     for _, item in ipairs(parsed.diagnostics) do
-      item.command = command
+      item.command = entry.original
       item.source = entry.source
       diagnostics[#diagnostics + 1] = item
     end
 
-    local supported = M.supported[command] == true
-    if not supported and entry.source ~= "default" and not parsed.disabled then
-      add_diagnostic(diagnostics, "info", "unsupported_command",
-        ("OpenCode command %q is configured but this client has no action for it; its keys are ignored"):format(command),
-        { command = command, source = entry.source })
-    end
-
     local keys = {}
+    local alternatives = {}
     for _, alternative in ipairs(parsed.alternatives) do
-      keys[#keys + 1] = alternative.lhs
-      if alternative.repeated then
-        add_diagnostic(diagnostics, "info", "sequence_timeout",
-          ("%s uses %q and waits up to %d ms between keys; a single press is not treated as the action"):format(
-            command, alternative.lhs, seq_timeout
+      local bytes, lhs, encode_error = encoder.sequence(alternative.strokes)
+      if bytes then
+        alternative.bytes = bytes
+        alternative.lhs = lhs
+        keys[#keys + 1] = lhs
+        alternatives[#alternatives + 1] = alternative
+        if alternative.repeated then
+          add_diagnostic(diagnostics, "info", "sequence_timeout",
+            ("%s uses %q and waits up to %d ms between keys"):format(
+              entry.original, lhs, seq_timeout
+            ),
+            { command = entry.original, key = lhs })
+        end
+      elseif entry.source ~= "default" then
+        -- Native defaults that cannot be represented in a terminal are simply
+        -- unavailable; only user-provided bindings produce a diagnostic.
+        add_diagnostic(diagnostics, "warn", "unsupported_key",
+          ("cannot encode %s as terminal input: %s"):format(
+            alternative.lhs or entry.original, tostring(encode_error)
           ),
-          { command = command, key = alternative.lhs })
+          { command = entry.original, key = alternative.lhs })
       end
     end
 
-    bindings[command] = {
-      command = command,
-      supported = supported,
+    local binding = {
+      command = entry.original,
+      supported = true,
+      forwarded = true,
       source = entry.source,
       disabled = parsed.disabled == true,
-      alternatives = parsed.alternatives,
+      alternatives = alternatives,
       keys = keys,
-      modes = modes_for(command, opts),
+      modes = { "n" },
     }
+
+    bindings[entry.original] = binding
+    if name ~= entry.original then
+      bindings[name] = binding
+    end
+    local alias = alias_for(entry.original)
+    if alias and bindings[alias] == nil then
+      bindings[alias] = binding
+    end
   end
 
   return {
@@ -464,6 +444,20 @@ function M.resolve(opts)
     diagnostics = diagnostics,
     cli = source,
   }
+end
+
+--- Encode one resolved alternative as terminal bytes.
+--- @param alternative table
+--- @return string|nil bytes
+function M.alternative_bytes(alternative)
+  if type(alternative) ~= "table" then
+    return nil
+  end
+  if alternative.bytes then
+    return alternative.bytes
+  end
+  local bytes = encoder.sequence(alternative.strokes)
+  return bytes
 end
 
 --- Health-style diagnostics for the active configuration.
@@ -489,447 +483,6 @@ function M.health(opts)
   return results
 end
 
-local states = {}
-local augroup = nil
-
-local function augroup_id()
-  if augroup == nil then
-    augroup = vim.api.nvim_create_augroup("OpencodeKeybindings", { clear = false })
-  end
-  return augroup
-end
-
-local function valid_buf(buf)
-  return type(buf) == "number" and vim.api.nvim_buf_is_valid(buf)
-end
-
-local function stop_timer(state)
-  if state.timer then
-    pcall(state.timer.stop, state.timer)
-    pcall(state.timer.close, state.timer)
-    state.timer = nil
-  end
-end
-
-local function clear_buffer_autocmds(buf)
-  if not valid_buf(buf) then
-    return
-  end
-  pcall(vim.api.nvim_clear_autocmds, { group = augroup_id(), buffer = buf })
-end
-
-local function sequence_context(buf)
-  local win = vim.api.nvim_get_current_win()
-  local ok, position = pcall(vim.api.nvim_win_get_cursor, win)
-  local current_buf = vim.api.nvim_win_get_buf(win)
-  return {
-    buffer = current_buf,
-    line = ok and position[1] or nil,
-    column = ok and position[2] or nil,
-    changenr = vim.fn.changenr(),
-    mode = vim.api.nvim_get_mode().mode,
-    wanted_buffer = buf,
-  }
-end
-
-local function same_context(left, right)
-  if not left or not right then
-    return false
-  end
-  return left.buffer == right.buffer
-    and left.line == right.line
-    and left.column == right.column
-    and left.changenr == right.changenr
-    and left.mode == right.mode
-    and left.wanted_buffer == right.wanted_buffer
-end
-
-local function arm_sequence_timer(state, entry)
-  stop_timer(state)
-  local timer = vim.uv.new_timer()
-  if not timer then
-    state.pending = nil
-    return
-  end
-  state.timer = timer
-  timer:start(state.sequence_timeout, 0, vim.schedule_wrap(function()
-    if state.timer == timer then
-      state.timer = nil
-      state.pending = nil
-    end
-    pcall(timer.stop, timer)
-    pcall(timer.close, timer)
-  end))
-end
-
-local function repeated_handler(state, entry)
-  return function()
-    if state.detached or not valid_buf(state.buf) then
-      return
-    end
-    local now = vim.uv.hrtime()
-    local pending = state.pending
-    local context = sequence_context(state.buf)
-    local count
-    if pending
-        and pending.entry == entry
-        and same_context(pending.context, context)
-        and (now - pending.time) <= state.sequence_timeout * 1000000
-    then
-      count = pending.count + 1
-    else
-      count = 1
-    end
-
-    if count >= entry.count then
-      state.pending = nil
-      stop_timer(state)
-      entry.action()
-      return
-    end
-
-    state.pending = {
-      entry = entry,
-      count = count,
-      time = now,
-      context = context,
-    }
-    arm_sequence_timer(state, entry)
-  end
-end
-
-local function single_handler(state, entry)
-  return function()
-    if state.detached or not valid_buf(state.buf) then
-      return
-    end
-    state.pending = nil
-    stop_timer(state)
-    entry.action()
-  end
-end
-
--- Read buffer-local mappings directly from the target buffer instead of
--- calling maparg() in whichever buffer happens to be current.  This never
--- switches windows or buffers.  attach()/detach() reject fast events, and the
--- canonicalization helpers additionally degrade to exact lhs matching there.
-local function canonical_lhs(lhs)
-  if vim.in_fast_event() then
-    return lhs
-  end
-  local raw_ok, raw = pcall(vim.api.nvim_replace_termcodes, lhs, true, false, true)
-  if not raw_ok then
-    return lhs
-  end
-  local text_ok, text = pcall(vim.fn.keytrans, raw)
-  if text_ok and type(text) == "string" and text ~= "" then
-    return text
-  end
-  return lhs
-end
-
-local function buffer_keymaps(buf, mode)
-  if vim.in_fast_event() or not valid_buf(buf) then
-    return {}
-  end
-  local ok, maps = pcall(vim.api.nvim_buf_get_keymap, buf, mode)
-  if ok and type(maps) == "table" then
-    return maps
-  end
-  return {}
-end
-
-local function find_buffer_mapping(buf, mode, lhs)
-  local maps = buffer_keymaps(buf, mode)
-  if #maps == 0 then
-    return nil
-  end
-
-  local raw
-  if not vim.in_fast_event() then
-    local raw_ok, converted = pcall(vim.api.nvim_replace_termcodes, lhs, true, false, true)
-    if raw_ok then
-      raw = converted
-    end
-  end
-  local wanted = canonical_lhs(lhs)
-
-  for _, map in ipairs(maps) do
-    if type(map.lhsraw) == "string" and raw ~= nil
-        and (map.lhsraw == raw or map.lhsrawalt == raw)
-    then
-      return map
-    end
-    if type(map.lhs) == "string" and (map.lhs == lhs or canonical_lhs(map.lhs) == wanted) then
-      return map
-    end
-  end
-  return nil
-end
-
-local function mapping_exists(buf, mode, lhs)
-  return find_buffer_mapping(buf, mode, lhs) ~= nil
-end
-
-local function entries_for(resolved, opts, diagnostics)
-  local actions = type(opts.actions) == "table" and opts.actions or {}
-  local entries = {}
-
-  for command, binding in pairs(resolved.bindings) do
-    local action = actions[command]
-    if type(action) == "function" then
-      if not binding.disabled then
-        for _, alternative in ipairs(binding.alternatives) do
-          for _, mode in ipairs(binding.modes) do
-            entries[#entries + 1] = {
-              command = command,
-              mode = mode,
-              action = action,
-              lhs = alternative.repeated and alternative.first_lhs or alternative.lhs,
-              full_lhs = alternative.lhs,
-              count = alternative.count,
-              repeated = alternative.repeated == true,
-            }
-          end
-        end
-      end
-    elseif binding.supported and not binding.disabled then
-      add_diagnostic(diagnostics, "info", "no_action",
-        ("OpenCode command %q has key bindings but no injected action; skipping"):format(command),
-        { command = command })
-    end
-  end
-
-  -- A single-key mapping would immediately consume a longer sequence that
-  -- starts with it.  Prefer the longer sequence and report the conflict.
-  local filtered = {}
-  for _, entry in ipairs(entries) do
-    local shadowed = false
-    if entry.count == 1 then
-      for _, other in ipairs(entries) do
-        if other ~= entry and other.mode == entry.mode and other.full_lhs ~= entry.full_lhs
-            and other.full_lhs:sub(1, #entry.full_lhs) == entry.full_lhs
-        then
-          shadowed = true
-          add_diagnostic(diagnostics, "warn", "prefix_conflict",
-            ("%q is a prefix of %q; the shorter binding is disabled"):format(entry.full_lhs, other.full_lhs),
-            { command = entry.command })
-          break
-        end
-      end
-    end
-    if not shadowed then
-      filtered[#filtered + 1] = entry
-    end
-  end
-
-  local by_lhs = {}
-  local order = {}
-  for _, entry in ipairs(filtered) do
-    local map_key = entry.mode .. "\0" .. entry.lhs
-    local existing = by_lhs[map_key]
-    if existing then
-      if entry.full_lhs ~= existing.full_lhs then
-        add_diagnostic(diagnostics, "warn", "mapping_conflict",
-          ("%q and %q both map %q; keeping the longer binding"):format(
-            existing.full_lhs, entry.full_lhs, entry.lhs
-          ),
-          { command = entry.command })
-      end
-      if entry.count > existing.count then
-        by_lhs[map_key] = entry
-      end
-    else
-      by_lhs[map_key] = entry
-      order[#order + 1] = map_key
-    end
-  end
-
-  local result = {}
-  for _, map_key in ipairs(order) do
-    result[#result + 1] = by_lhs[map_key]
-  end
-  return result
-end
-
---- Attach semantic keybindings to one buffer.
----
---- @param buf number
---- @param opts table|nil Same resolve() options plus:
----   actions: command -> function
----   modes: command -> mode/list override (interrupt stays Normal)
---- @return table|nil handle, table|nil error
-function M.attach(buf, opts)
-  opts = opts or {}
-  if vim.in_fast_event() then
-    return nil, {
-      code = "fast_event",
-      message = "keybindings.attach must not run in a fast event",
-    }
-  end
-  if not valid_buf(buf) then
-    return nil, {
-      code = "invalid_buffer",
-      message = "keybindings.attach requires a valid buffer number",
-    }
-  end
-
-  M.detach(buf)
-
-  local resolved
-  if type(opts.resolved) == "table" and type(opts.resolved.bindings) == "table" then
-    resolved = opts.resolved
-  else
-    resolved = M.resolve(opts)
-  end
-  local diagnostics = copy(resolved.diagnostics) or {}
-  local state = {
-    buf = buf,
-    resolved = resolved,
-    diagnostics = diagnostics,
-    mappings = {},
-    pending = nil,
-    timer = nil,
-    sequence_timeout = resolved.sequence_timeout,
-    detached = false,
-  }
-
-  local entries = entries_for(resolved, opts, diagnostics)
-  for _, entry in ipairs(entries) do
-    if mapping_exists(buf, entry.mode, entry.lhs) then
-      add_diagnostic(diagnostics, "warn", "mapping_conflict",
-        ("buffer-local mapping %q already exists; not replacing it"):format(entry.lhs),
-        { command = entry.command, mode = entry.mode })
-    else
-      local callback
-      if entry.repeated then
-        callback = repeated_handler(state, entry)
-      else
-        callback = single_handler(state, entry)
-      end
-      local ok, err = pcall(vim.keymap.set, entry.mode, entry.lhs, callback, {
-        buffer = buf,
-        silent = true,
-        nowait = entry.count == 1 or entry.repeated,
-        noremap = true,
-        desc = MAPPING_DESC_PREFIX .. entry.command,
-      })
-      if ok then
-        state.mappings[#state.mappings + 1] = {
-          mode = entry.mode,
-          lhs = entry.lhs,
-          command = entry.command,
-          full_lhs = entry.full_lhs,
-        }
-      else
-        add_diagnostic(diagnostics, "warn", "mapping_failed",
-          ("cannot map %q in mode %q: %s"):format(entry.lhs, entry.mode, tostring(err)),
-          { command = entry.command, mode = entry.mode })
-      end
-    end
-  end
-
-  states[buf] = state
-
-  clear_buffer_autocmds(buf)
-  if valid_buf(buf) then
-    pcall(vim.api.nvim_create_autocmd, "BufWipeout", {
-      group = augroup_id(),
-      buffer = buf,
-      once = true,
-      callback = function()
-        M.detach(buf)
-      end,
-    })
-    -- A sequence is only valid while the user stays in the same editing
-    -- context.  These buffer-local events reset a pending repeated-key
-    -- sequence without installing a global on_key hook.
-    pcall(vim.api.nvim_create_autocmd, {
-      "ModeChanged",
-      "CursorMoved",
-      "CursorMovedI",
-      "TextChanged",
-      "TextChangedI",
-      "InsertEnter",
-      "CmdlineEnter",
-      "BufLeave",
-      "WinLeave",
-    }, {
-      group = augroup_id(),
-      buffer = buf,
-      callback = function()
-        if states[buf] == state and state.pending then
-          state.pending = nil
-          stop_timer(state)
-        end
-      end,
-    })
-  end
-
-  return state
-end
-
---- Remove all mappings and timers owned by this module for one buffer.
---- @param buf number
---- @return boolean detached
-function M.detach(buf)
-  if vim.in_fast_event() then
-    return false
-  end
-  local state = states[buf]
-  if not state then
-    return false
-  end
-  states[buf] = nil
-  state.detached = true
-  state.pending = nil
-  stop_timer(state)
-
-  if valid_buf(buf) then
-    for _, mapping in ipairs(state.mappings) do
-      local current = find_buffer_mapping(buf, mapping.mode, mapping.lhs)
-      local owned = type(current) == "table"
-        and current.desc == MAPPING_DESC_PREFIX .. mapping.command
-      -- Do not remove a mapping another plugin replaced after attach().
-      if owned then
-        pcall(vim.keymap.del, mapping.mode, mapping.lhs, { buffer = buf })
-      end
-    end
-  end
-  clear_buffer_autocmds(buf)
-  state.mappings = {}
-  return true
-end
-
---- @param buf number
---- @return boolean
-function M.is_attached(buf)
-  return states[buf] ~= nil and not states[buf].detached
-end
-
---- Diagnostic/testing view of one attached buffer.
---- @param buf number
---- @return table|nil
-function M.get_state(buf)
-  local state = states[buf]
-  if not state then
-    return nil
-  end
-  local pending = nil
-  if state.pending then
-    pending = {
-      count = state.pending.count,
-      time = state.pending.time,
-    }
-  end
-  return {
-    buffer = state.buf,
-    resolved = state.resolved,
-    diagnostics = copy(state.diagnostics),
-    mappings = copy(state.mappings),
-    pending = pending,
-    detached = state.detached,
-  }
-end
+M.canonical = canonical
 
 return M

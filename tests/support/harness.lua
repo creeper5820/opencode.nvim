@@ -373,42 +373,6 @@ function M:free_port()
   return address.port
 end
 
---- Explicit real-service configuration. Never falls back to the default
---- OpenCode instance. Returns nil and a skip reason when not configured.
-function M.real_service()
-  local url = vim.env.OPENCODE_TEST_SERVER_URL
-  if not url or url == "" then
-    return nil, "OPENCODE_TEST_SERVER_URL is not set; skipping real service test"
-  end
-
-  local authority = url:match("^http://([^/?#]+)")
-  local host, port
-  if authority then
-    host, port = authority:match("^(.-):(%d+)$")
-  end
-  if port == "4096" and (host == "127.0.0.1" or host == "localhost" or host == "[::1]") then
-    return nil, "refusing to use the default OpenCode endpoint; start an isolated test service on a distinct port"
-  end
-
-  local data_home = vim.env.OPENCODE_TEST_DATA_HOME
-  if data_home and data_home ~= "" and not is_under(data_home, OPENCODE_TMP) then
-    return nil, "OPENCODE_TEST_DATA_HOME must point inside /tmp/opencode; refusing to use a real service"
-  end
-
-  local ok, resolved = pcall(function()
-    return require("opencode.config").resolve({ server = { url = url, headers = {} } })
-  end)
-  if not ok then
-    return nil, "invalid OPENCODE_TEST_SERVER_URL: " .. tostring(resolved)
-  end
-
-  return {
-    url = resolved.server.url,
-    headers = {},
-    data_home = data_home,
-  }
-end
-
 --- Register an extra cleanup action owned by this harness.
 function M:add_cleanup(fn)
   if type(fn) ~= "function" then

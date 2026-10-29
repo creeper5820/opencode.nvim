@@ -1,52 +1,68 @@
 local M = {}
 
 M.defaults = {
-  server = {
-    url = "http://127.0.0.1:4096",
-    headers = {},
-  },
+  -- OpenCode executable. A list is accepted for launchers such as
+  -- `{ "bunx", "opencode" }`; the positional project directory is appended.
+  cmd = "opencode",
+  args = {},
+  -- nil uses project.root, then Neovim's current working directory.
+  cwd = nil,
   project = {
     root = nil,
   },
-  sidebar = {
-    width = 48,
-    input_height = 8,
+  session = {
+    -- Start with `opencode --continue`.
+    continue = false,
+    -- Start or resume a specific session with `opencode --session <id>`.
+    id = nil,
+    -- Pass `opencode --prompt <text>`; useful for scripted first prompts.
+    prompt = nil,
+  },
+  window = {
+    layout = "right", -- right | left | above | below
+    size = 80,
+    start_insert = true,
   },
   keymaps = {
     toggle = "<leader>oo",
     send_selection = "<leader>os",
     question_selection = "<leader>oq",
-    submit = "<C-s>",
+    -- Tab is only installed when it does not collide with an OpenCode
+    -- keybinding from cli.json. Set to false to disable it entirely.
+    focus_next = "<Tab>",
   },
   keybindings = {
     enabled = true,
-    -- nil uses keybindings.default_path(), i.e. OpenCode's cli.json.
+    -- nil uses $OPENCODE_CONFIG_DIR/cli.json or the XDG config directory.
     cli_path = nil,
     read_cli = true,
     overrides = {},
     sequence_timeout = nil,
   },
-  completion = {
-    enabled = true,
-    auto = true,
-    minimum_length = 1,
-    debounce = 100,
-    limit = 20,
-    cache_ttl = 30000,
-    file_cache_ttl = 0,
+  input = {
+    -- Composer Vim-like editing primitives (h/l/w/b/x/dd/...).
+    primitives = true,
+    -- Forward otherwise unbound Normal-mode keys to the TUI.
+    passthrough = true,
   },
-  status = {
-    enabled = true,
-    spinner_interval = 1000,
-    submit_hint = nil,
+  paste = {
+    -- Send bracketed-paste guards around composer text.
+    bracketed = true,
+    -- Delay before pasting right after a cold terminal start (ms).
+    ready_delay = 150,
+    -- Separate paste from submit so multiline text is not submitted early.
+    submit_delay = 30,
   },
-  tools = {
-    -- The local tool server is started once the project root is known, but
-    -- only when the optional OpenCode companion is expected to call it.
-    enabled = true,
-    registry_dir = nil,
-    instance_id = nil,
+  focus = {
+    initial = "composer", -- composer | session
   },
+}
+
+local LAYOUTS = {
+  right = true,
+  left = true,
+  above = true,
+  below = true,
 }
 
 local function is_list(value)
@@ -90,75 +106,25 @@ local function merge(base, override)
   return result
 end
 
-local function validate_url(url)
-  if type(url) ~= "string" or url == "" then
-    error("opencode: server.url must be a non-empty string", 0)
+local function validate_string_list(name, value, allow_empty)
+  if type(value) ~= "table" then
+    error(("opencode: %s must be a list of strings"):format(name), 0)
   end
-  local scheme, rest = url:match("^(%a[%w+.-]*)://(.+)$")
-  if not scheme then
-    error(("opencode: server.url %q must be an absolute http:// URL"):format(url), 0)
-  end
-  scheme = scheme:lower()
-  if scheme == "https" then
-    error("opencode: server.url uses https, which is not supported yet (TLS transport is not implemented)", 0)
-  end
-  if scheme ~= "http" then
-    error(("opencode: server.url scheme %q is not supported; use http://"):format(scheme), 0)
-  end
-  if url:find("%s") then
-    error(("opencode: server.url %q must not contain whitespace"):format(url), 0)
-  end
-  local authority = rest:match("^([^/?#]+)")
-  if not authority or authority == "" then
-    error(("opencode: server.url %q is missing a host"):format(url), 0)
-  end
-
-  local host, port
-  if authority:sub(1, 1) == "[" then
-    host, port = authority:match("^%[([^%]]+)%]:(%d+)$")
-    if not host then
-      host = authority:match("^%[([^%]]+)%]$")
+  local count = 0
+  for key, item in pairs(value) do
+    if type(key) ~= "number" or key < 1 or key ~= math.floor(key) then
+      error(("opencode: %s must be a list of strings"):format(name), 0)
     end
-    if not host then
-      error(("opencode: server.url %q has an invalid host or port"):format(url), 0)
+    if type(item) ~= "string" or item == "" then
+      error(("opencode: %s must contain only non-empty strings"):format(name), 0)
     end
-  else
-    host, port = authority:match("^(.-):(%d+)$")
-    if not host then
-      if authority:find(":", 1, true) then
-        error(("opencode: server.url %q has an invalid port"):format(url), 0)
-      end
-      host = authority
-    end
+    count = count + 1
   end
-  if host == "" then
-    error(("opencode: server.url %q is missing a host"):format(url), 0)
+  if count ~= #value then
+    error(("opencode: %s must be a contiguous list of strings"):format(name), 0)
   end
-  if port then
-    local number = tonumber(port)
-    if not number or number < 1 or number > 65535 then
-      error(("opencode: server.url %q has an invalid port"):format(url), 0)
-    end
-  end
-end
-
-local function validate_headers(headers)
-  if type(headers) ~= "table" then
-    error("opencode: server.headers must be a table", 0)
-  end
-  for name, value in pairs(headers) do
-    if type(name) ~= "string" or name == "" then
-      error("opencode: server.headers keys must be non-empty strings", 0)
-    end
-    if name:find("[\r\n]") then
-      error(("opencode: server.headers[%q] must not contain CR or LF"):format(name), 0)
-    end
-    if type(value) ~= "string" then
-      error(("opencode: server.headers[%q] must be a string"):format(name), 0)
-    end
-    if value:find("[\r\n]") then
-      error(("opencode: server.headers[%q] must not contain CR or LF"):format(name), 0)
-    end
+  if not allow_empty and #value == 0 then
+    error(("opencode: %s must not be empty"):format(name), 0)
   end
 end
 
@@ -171,16 +137,36 @@ local function validate_dimension(name, value, minimum, maximum)
   end
 end
 
-local function validate(config)
+local function validate_keymaps(keymaps)
+  if type(keymaps) ~= "table" then
+    error("opencode: keymaps must be a table", 0)
+  end
+  for name, value in pairs(keymaps) do
+    if type(name) ~= "string" then
+      error("opencode: keymaps keys must be strings", 0)
+    end
+    if value ~= nil and value ~= false and (type(value) ~= "string" or value == "") then
+      error(("opencode: keymaps.%s must be a non-empty string or false"):format(name), 0)
+    end
+  end
+end
+
+local function validate_config(config)
   if type(config) ~= "table" then
     error("opencode: configuration must be a table", 0)
   end
 
-  if type(config.server) ~= "table" then
-    error("opencode: server must be a table", 0)
+  if type(config.cmd) == "string" then
+    if config.cmd == "" then
+      error("opencode: cmd must be a non-empty string or a list of strings", 0)
+    end
+  else
+    validate_string_list("cmd", config.cmd, false)
   end
-  validate_url(config.server.url)
-  validate_headers(config.server.headers)
+  validate_string_list("args", config.args, true)
+  if config.cwd ~= nil and (type(config.cwd) ~= "string" or config.cwd == "") then
+    error("opencode: cwd must be nil or a non-empty string", 0)
+  end
 
   if type(config.project) ~= "table" then
     error("opencode: project must be a table", 0)
@@ -189,23 +175,31 @@ local function validate(config)
     error("opencode: project.root must be nil or a non-empty string", 0)
   end
 
-  if type(config.sidebar) ~= "table" then
-    error("opencode: sidebar must be a table", 0)
+  if type(config.session) ~= "table" then
+    error("opencode: session must be a table", 0)
   end
-  validate_dimension("sidebar.width", config.sidebar.width, 1, 1000)
-  validate_dimension("sidebar.input_height", config.sidebar.input_height, 1, 1000)
+  if type(config.session.continue) ~= "boolean" then
+    error("opencode: session.continue must be a boolean", 0)
+  end
+  if config.session.id ~= nil and (type(config.session.id) ~= "string" or config.session.id == "") then
+    error("opencode: session.id must be nil or a non-empty string", 0)
+  end
+  if config.session.prompt ~= nil and type(config.session.prompt) ~= "string" then
+    error("opencode: session.prompt must be nil or a string", 0)
+  end
 
-  if type(config.keymaps) ~= "table" then
-    error("opencode: keymaps must be a table", 0)
+  if type(config.window) ~= "table" then
+    error("opencode: window must be a table", 0)
   end
-  for name, value in pairs(config.keymaps) do
-    if type(name) ~= "string" then
-      error("opencode: keymaps keys must be strings", 0)
-    end
-    if value ~= nil and value ~= false and (type(value) ~= "string" or value == "") then
-      error(("opencode: keymaps.%s must be a non-empty string or false"):format(name), 0)
-    end
+  if not LAYOUTS[config.window.layout] then
+    error("opencode: window.layout must be one of right, left, above, below", 0)
   end
+  validate_dimension("window.size", config.window.size, 1, 1000)
+  if type(config.window.start_insert) ~= "boolean" then
+    error("opencode: window.start_insert must be a boolean", 0)
+  end
+
+  validate_keymaps(config.keymaps)
 
   if type(config.keybindings) ~= "table" then
     error("opencode: keybindings must be a table", 0)
@@ -227,46 +221,29 @@ local function validate(config)
     error("opencode: keybindings.sequence_timeout must be nil or a positive number", 0)
   end
 
-  if type(config.completion) ~= "table" then
-    error("opencode: completion must be a table", 0)
+  if type(config.input) ~= "table" then
+    error("opencode: input must be a table", 0)
   end
-  for _, name in ipairs({ "enabled", "auto" }) do
-    if type(config.completion[name]) ~= "boolean" then
-      error(("opencode: completion.%s must be a boolean"):format(name), 0)
+  for _, name in ipairs({ "primitives", "passthrough" }) do
+    if type(config.input[name]) ~= "boolean" then
+      error(("opencode: input.%s must be a boolean"):format(name), 0)
     end
   end
-  validate_dimension("completion.minimum_length", config.completion.minimum_length, 0, 1000)
-  validate_dimension("completion.debounce", config.completion.debounce, 0, 60000)
-  validate_dimension("completion.limit", config.completion.limit, 1, 1000)
-  validate_dimension("completion.cache_ttl", config.completion.cache_ttl, 0, 86400000)
-  validate_dimension("completion.file_cache_ttl", config.completion.file_cache_ttl, 0, 86400000)
 
-  if type(config.status) ~= "table" then
-    error("opencode: status must be a table", 0)
+  if type(config.paste) ~= "table" then
+    error("opencode: paste must be a table", 0)
   end
-  if type(config.status.enabled) ~= "boolean" then
-    error("opencode: status.enabled must be a boolean", 0)
+  if type(config.paste.bracketed) ~= "boolean" then
+    error("opencode: paste.bracketed must be a boolean", 0)
   end
-  validate_dimension("status.spinner_interval", config.status.spinner_interval, 50, 60000)
-  if config.status.submit_hint ~= nil and type(config.status.submit_hint) ~= "string" then
-    error("opencode: status.submit_hint must be nil or a string", 0)
-  end
+  validate_dimension("paste.ready_delay", config.paste.ready_delay, 0, 60000)
+  validate_dimension("paste.submit_delay", config.paste.submit_delay, 0, 60000)
 
-  if type(config.tools) ~= "table" then
-    error("opencode: tools must be a table", 0)
+  if type(config.focus) ~= "table" then
+    error("opencode: focus must be a table", 0)
   end
-  if type(config.tools.enabled) ~= "boolean" then
-    error("opencode: tools.enabled must be a boolean", 0)
-  end
-  if config.tools.registry_dir ~= nil
-    and (type(config.tools.registry_dir) ~= "string" or config.tools.registry_dir == "")
-  then
-    error("opencode: tools.registry_dir must be nil or a non-empty string", 0)
-  end
-  if config.tools.instance_id ~= nil
-    and (type(config.tools.instance_id) ~= "string" or config.tools.instance_id == "")
-  then
-    error("opencode: tools.instance_id must be nil or a non-empty string", 0)
+  if config.focus.initial ~= "composer" and config.focus.initial ~= "session" then
+    error("opencode: focus.initial must be 'composer' or 'session'", 0)
   end
 end
 
@@ -278,7 +255,7 @@ function M.resolve(opts)
     error("opencode: setup() expects a table or nil", 0)
   end
   local resolved = merge(M.defaults, opts or {})
-  validate(resolved)
+  validate_config(resolved)
   return resolved
 end
 
