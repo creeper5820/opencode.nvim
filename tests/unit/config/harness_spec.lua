@@ -71,28 +71,238 @@ io.stdout:write(table.concat(out, "\n"))
     end
   end)
 
-  test.it("loads plugin/opencode.lua repeatedly without duplicate state", function()
+  test.it("loads plugin/opencode.lua and registers final commands, keymaps and autocmds", function()
     local h = harness.new()
     local ok, err = pcall(function()
       local result = h:spawn([[
 vim.cmd("runtime! plugin/opencode.lua")
 vim.cmd("runtime! plugin/opencode.lua")
 local opencode = require("opencode")
-local cfg = opencode.setup({ sidebar = { width = 55 } })
-io.stdout:write(tostring(vim.g.loaded_opencode_nvim) .. "\n")
-io.stdout:write(tostring(#vim.api.nvim_get_commands({ builtin = false })) .. "\n")
-local has_group = pcall(vim.api.nvim_get_autocmds, { group = "OpencodeNvim" })
-io.stdout:write(tostring(has_group) .. "\n")
-io.stdout:write(tostring(vim.fn.maparg("<leader>oo", "n") == "" and vim.fn.maparg("<leader>os", "x") == "" and vim.fn.maparg("<C-s>", "n") == "") .. "\n")
-io.stdout:write(tostring(cfg.sidebar.width))
+opencode.setup({
+  keybindings = { enabled = false },
+  completion = { enabled = false },
+  status = { enabled = false },
+  tools = { enabled = false },
+})
+local commands = vim.api.nvim_get_commands({ builtin = false })
+local function has_command(name)
+  return commands[name] ~= nil
+end
+local function mapped(lhs, mode)
+  local map = vim.fn.maparg(lhs, mode, false, true)
+  return type(map) == "table" and map.lhs ~= nil
+end
+local function has_global_desc(desc)
+  for _, mode in ipairs({ "i", "n", "x" }) do
+    for _, map in ipairs(vim.api.nvim_get_keymap(mode)) do
+      if map.desc == desc then
+        return true
+      end
+    end
+  end
+  return false
+end
+local function group_count(name)
+  local ok, list = pcall(vim.api.nvim_get_autocmds, { group = name })
+  return ok and #list or 0
+end
+local out = {
+  tostring(vim.g.loaded_opencode_nvim),
+  tostring(has_command("OpenCode") and has_command("OpenCodeToggle")
+    and has_command("OpenCodeSubmit") and has_command("OpenCodeHealth")),
+  tostring(mapped("<Space>oo", "n")),
+  tostring(mapped("<Space>os", "x")),
+  tostring(mapped("<Space>oq", "x")),
+  tostring(has_global_desc("OpenCode: submit input")),
+  tostring(group_count("OpencodeNvimIntegration") > 0),
+  tostring(group_count("OpencodeNvimExit") > 0),
+  vim.env.XDG_CONFIG_HOME,
+  vim.o.shadafile,
+  vim.fn.getcwd(),
+  tostring(opencode.get_config().sidebar.width),
+}
+io.stdout:write(table.concat(out, "\n"))
 ]])
       test.equal(0, result.code, "child failed: " .. result.stderr)
       local lines = vim.split(result.stdout, "\n", { plain = true })
       test.equal("1", lines[1], "load guard must be set")
-      test.equal("0", lines[2], "no commands should be registered in this phase")
-      test.equal("false", lines[3], "no plugin autocmds should be registered")
-      test.equal("true", lines[4], "no business keymaps should be registered")
-      test.equal("55", lines[5])
+      test.equal("true", lines[2], "final commands must be registered")
+      test.equal("true", lines[3], "toggle keymap must be registered")
+      test.equal("true", lines[4], "send_selection keymap must be registered")
+      test.equal("true", lines[5], "question_selection keymap must be registered")
+      test.equal("false", lines[6], "submit must stay buffer-local")
+      test.equal("true", lines[7], "integration autocmds must be registered")
+      test.equal("true", lines[8], "exit autocmd must be registered")
+      test.equal(h.paths.config, lines[9], "child must use the isolated config dir")
+      test.equal(h.paths.shada, lines[10], "child must use the isolated shada file")
+      test.equal(h.paths.project, lines[11], "child must use the isolated project cwd")
+      test.equal("48", lines[12])
+    end)
+    h:cleanup()
+    if not ok then
+      error(err, 0)
+    end
+  end)
+
+  test.it("honors false keymaps and maps submit buffer-locally", function()
+    local h = harness.new()
+    local ok, err = pcall(function()
+      local result = h:spawn([[
+vim.cmd("runtime! plugin/opencode.lua")
+local opencode = require("opencode")
+local ui = require("opencode.ui")
+local common = {
+  keybindings = { enabled = false },
+  completion = { enabled = false },
+  status = { enabled = false },
+  tools = { enabled = false },
+}
+local function opts(keymaps)
+  local value = vim.deepcopy(common)
+  value.keymaps = keymaps
+  return value
+end
+local function map_info(lhs, mode)
+  local map = vim.fn.maparg(lhs, mode, false, true)
+  if type(map) ~= "table" or map.lhs == nil then
+    return "none"
+  end
+  return tostring(map.buffer) .. ":" .. tostring(map.lhs)
+end
+local function submit_maps()
+  local input = ui.get_buffers().input
+  local found = {}
+  for _, mode in ipairs({ "i", "n" }) do
+    for _, map in ipairs(vim.api.nvim_buf_get_keymap(input, mode)) do
+      if map.desc == "OpenCode: submit input" then
+        found[#found + 1] = mode .. ":" .. map.lhs
+      end
+    end
+  end
+  table.sort(found)
+  return #found == 0 and "none" or table.concat(found, ",")
+end
+opencode.setup(opts({ toggle = false, send_selection = false, question_selection = false, submit = false }))
+ui.open()
+local out = {
+  map_info("<Space>oo", "n"),
+  map_info("<Space>os", "x"),
+  map_info("<Space>oq", "x"),
+  submit_maps(),
+}
+opencode.setup(opts({}))
+out[#out + 1] = map_info("<Space>oo", "n")
+out[#out + 1] = map_info("<Space>os", "x")
+out[#out + 1] = map_info("<Space>oq", "x")
+out[#out + 1] = submit_maps()
+opencode.setup(opts({ toggle = false, send_selection = false, question_selection = false, submit = false }))
+out[#out + 1] = submit_maps()
+io.stdout:write(table.concat(out, "\n"))
+]])
+      test.equal(0, result.code, "child failed: " .. result.stderr)
+      local lines = vim.split(result.stdout, "\n", { plain = true, trimempty = false })
+      test.equal("none", lines[1], "toggle must be disabled")
+      test.equal("none", lines[2], "send_selection must be disabled")
+      test.equal("none", lines[3], "question_selection must be disabled")
+      test.equal("none", lines[4], "submit must be disabled")
+      test.equal("0:<Space>oo", lines[5], "default toggle must return")
+      test.equal("0:<Space>os", lines[6], "default send_selection must return")
+      test.equal("0:<Space>oq", lines[7], "default question_selection must return")
+      test.equal("i:<C-S>,n:<C-S>", lines[8], "submit must be buffer-local in insert and normal modes")
+      test.equal("none", lines[9], "submit=false must remove an existing buffer mapping")
+    end)
+    h:cleanup()
+    if not ok then
+      error(err, 0)
+    end
+  end)
+
+  test.it("repeated setup replaces maps without duplicate commands, keymaps or autocmds", function()
+    local h = harness.new()
+    local ok, err = pcall(function()
+      local result = h:spawn([[
+vim.cmd("runtime! plugin/opencode.lua")
+local opencode = require("opencode")
+local common = {
+  keybindings = { enabled = false },
+  completion = { enabled = false },
+  status = { enabled = false },
+  tools = { enabled = false },
+}
+local function opts(keymaps)
+  local value = vim.deepcopy(common)
+  value.keymaps = keymaps
+  return value
+end
+local function count_maps()
+  local count = 0
+  for _, mode in ipairs({ "n", "x" }) do
+    for _, map in ipairs(vim.api.nvim_get_keymap(mode)) do
+      if type(map.desc) == "string" and map.desc:match("^OpenCode:") then
+        count = count + 1
+      end
+    end
+  end
+  return count
+end
+local function group_count(name)
+  local ok, list = pcall(vim.api.nvim_get_autocmds, { group = name })
+  return ok and #list or 0
+end
+local function mapped(lhs, mode)
+  local map = vim.fn.maparg(lhs, mode, false, true)
+  return type(map) == "table" and map.lhs ~= nil
+end
+local function has_commands()
+  local commands = vim.api.nvim_get_commands({ builtin = false })
+  return commands.OpenCode ~= nil
+    and commands.OpenCodeToggle ~= nil
+    and commands.OpenCodeSubmit ~= nil
+    and commands.OpenCodeHealth ~= nil
+end
+local function snapshot()
+  return table.concat({
+    tostring(count_maps()),
+    tostring(group_count("OpencodeNvimIntegration")),
+    tostring(group_count("OpencodeNvimExit")),
+    tostring(has_commands()),
+    tostring(mapped("<Space>oo", "n")),
+    tostring(mapped("<Space>ot", "n")),
+  }, ",")
+end
+local out = {}
+opencode.setup(opts({}))
+out[#out + 1] = snapshot()
+opencode.setup(opts({ toggle = "<leader>ot" }))
+out[#out + 1] = snapshot()
+opencode.setup(opts({}))
+out[#out + 1] = snapshot()
+io.stdout:write(table.concat(out, "\n"))
+]])
+      test.equal(0, result.code, "child failed: " .. result.stderr)
+      local lines = vim.split(result.stdout, "\n", { plain = true, trimempty = false })
+      test.equal(lines[1], lines[3], "restoring defaults must not leave stale state")
+
+      local first = vim.split(lines[1], ",", { plain = true })
+      test.equal("3", first[1], "exactly three global OpenCode keymaps")
+      test.truthy(tonumber(first[2]) > 0, "integration autocmds must exist")
+      test.truthy(tonumber(first[3]) > 0, "exit autocmd must exist")
+      test.equal("true", first[4], "final commands must be present")
+      test.equal("true", first[5], "default toggle must be mapped")
+      test.equal("false", first[6], "custom toggle must not be mapped yet")
+
+      local second = vim.split(lines[2], ",", { plain = true })
+      test.equal("3", second[1], "changing a keymap must not duplicate global maps")
+      test.equal("true", second[4], "repeated setup must keep commands present")
+      test.equal("false", second[5], "old toggle must be removed")
+      test.equal("true", second[6], "custom toggle must be mapped")
+      test.equal(first[2], second[2], "integration autocmd count must stay stable")
+      test.equal(first[3], second[3], "exit autocmd count must stay stable")
+
+      local third = vim.split(lines[3], ",", { plain = true })
+      test.equal("3", third[1], "restoring defaults must not duplicate global maps")
+      test.equal("true", third[5], "default toggle must be restored")
+      test.equal("false", third[6], "custom toggle must be removed")
     end)
     h:cleanup()
     if not ok then

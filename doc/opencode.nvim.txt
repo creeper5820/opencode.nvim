@@ -101,8 +101,9 @@ session state are replaced.
         Submit the sidebar input.
 
 :OpenCodeHealth
-        Print core health plus semantic-keybinding diagnostics. Core checks
-        are also available through `:checkhealth opencode`.
+        Print the combined health report: core checks, semantic-keybinding
+        diagnostics and runtime tool-server errors when present. The core and
+        keybinding checks are also available through `:checkhealth opencode`.
 
 ==============================================================================
 4. KEYMAPS                                                 *opencode.nvim-keymaps*
@@ -180,10 +181,14 @@ writes to disk. Disable the local server with `tools.enabled = false`.
 7. HEALTH                                                     *opencode.nvim-health*
 
 `:checkhealth opencode` checks Neovim version, `vim.uv`, configuration and the
-server URL. It does not require the optional companion.
+server URL, then includes semantic-keybinding diagnostics (unsupported keys,
+CLI parsing issues, sequence settings and mapping conflicts).
 
-`:OpenCodeHealth` prints the same core checks plus semantic-keybinding
-diagnostics (unsupported keys, CLI parsing issues and mapping conflicts).
+`:OpenCodeHealth` prints the same combined report, plus runtime tool-server
+errors when present.
+
+The optional companion is not required: a missing companion or missing
+registry entry is informational only and never makes setup or health fail.
 
 ==============================================================================
 8. TESTING ISOLATION                                        *opencode.nvim-testing*

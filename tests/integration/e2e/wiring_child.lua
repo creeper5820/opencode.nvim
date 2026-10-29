@@ -236,9 +236,10 @@ local ok, err = xpcall(function()
   check(interrupt.result ~= nil and interrupt.result.idle == true, "idle interrupt no-op expected")
   check(interrupt.result.interrupted == false, "idle interrupt should report interrupted=false")
 
-  -- Existing buffer-local mappings are reported, not overwritten.
+  -- Existing buffer-local mappings are reported even when the target buffer is
+  -- not the current buffer, and are never overwritten.
   local messages = opencode.get_state().ui.buffers.messages
-  ui.focus_messages()
+  ui.focus_input()
   keybindings.detach(messages)
   vim.keymap.set("n", "<Esc>", function() end, {
     buffer = messages,

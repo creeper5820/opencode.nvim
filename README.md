@@ -60,11 +60,13 @@ implemented in the first version.
 | `:OpenCode [toggle\|open\|close\|submit\|interrupt\|reset\|health]` | Main command; no argument toggles the sidebar. |
 | `:OpenCodeToggle` | Open or hide the sidebar. |
 | `:OpenCodeSubmit` | Submit the current sidebar input. |
-| `:OpenCodeHealth` | Print core health plus semantic-keybinding diagnostics. |
+| `:OpenCodeHealth` | Print the combined health report, including semantic keybindings and runtime tool-server errors. |
 
-`:checkhealth opencode` reports the core environment and configuration.
-`:OpenCodeHealth` additionally reports OpenCode `cli.json` keybinding issues;
-both are non-blocking.
+`:checkhealth opencode` reports the core environment, configuration and
+OpenCode `cli.json`/semantic-keybinding diagnostics. `:OpenCodeHealth` prints
+the same combined report (including runtime tool-server errors when present).
+Missing optional companion files are informational only and never make setup or
+health fail.
 
 ## Default keymaps
 

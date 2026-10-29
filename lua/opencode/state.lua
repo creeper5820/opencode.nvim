@@ -41,6 +41,17 @@ local function merge(target, source)
   return target
 end
 
+local function v2_payload(kind, data)
+  if type(data) == "table"
+    and kind ~= nil
+    and data.type == kind
+    and type(data.data) == "table"
+  then
+    return data.data
+  end
+  return data
+end
+
 local State = {}
 State.__index = State
 
@@ -123,6 +134,7 @@ end
 function State:apply_event(event, generation)
   local kind = type(event) == "table" and first(event.type, event.event) or nil
   local data = type(event) == "table" and first(event.data, event.properties, event.payload) or nil
+  data = v2_payload(kind, data)
   local gen = generation or (type(event) == "table" and first(event.generation, event.gen, event.sync_generation)) or nil
   if gen ~= nil and gen < self.model.generation then
     return false

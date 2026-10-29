@@ -22,24 +22,24 @@
 
 | 编号 | 功能 | 状态 | 独立闭环 | 详细计划 |
 | --- | --- | --- | --- | --- |
-| 01 | 插件骨架、配置与测试基础 | ✅ 已完成 | 干净 Neovim 加载、配置校验、health 和测试 runner。 | [01-plugin-foundation.md](01-plugin-foundation.md) |
+| 01 | 插件骨架、配置与测试基础 | ✅ 已完成 | 最终装配测试、隔离 harness 及 keybinding health 诊断均通过。 | [01-plugin-foundation.md](01-plugin-foundation.md) |
 | 02A | 原生 HTTP transport | ✅ 已完成 | 假 TCP server 验证 HTTP/1.1、chunked、流式响应、超时和取消。 | [02a-http-transport.md](02a-http-transport.md) |
 | 02B | 无状态 OpenCode API client | ✅ 已完成 | 假 transport 验证 endpoint、JSON 和错误；隔离真实服务冒烟验证通过。 | [02b-opencode-api-client.md](02b-opencode-api-client.md) |
 | 03 | 双窗口侧边栏与 Vim 原生交互 | ✅ 已完成 | 假提交回调验证 window、buffer、草稿和快捷键边界。 | [03-sidebar-and-input.md](03-sidebar-and-input.md) |
 | 04 | Visual 选择上下文与两种提问 | ✅ 已完成 | 假 UI + 假 session 验证草稿和直接提问；真实 session 冒烟由 10 验证。 | [04-selection-actions.md](04-selection-actions.md) |
 | 05A | Session controller 与提交路由 | ✅ 已完成 | 假 client 验证项目固定、会话创建/恢复及 prompt/command 路由。 | [05a-session-controller.md](05a-session-controller.md) |
 | 05B | SSE 解析与无竞态同步 | ✅ 已完成 | 假 stream + 假历史 API 验证暂存、合并、重连和 location 过滤。 | [05b-sse-sync.md](05b-sse-sync.md) |
-| 05C | 结构化 block 投影与状态归并 | ✅ 已完成 | 纯 fixtures 验证 block 树、父子关系、去重、revision 和权限状态。 | [05c-block-model.md](05c-block-model.md) |
+| 05C | 结构化 block 投影与状态归并 | ✅ 已完成 | V1/V2 历史与 inbox 事件均可投影；真实隔离服务验证用户消息进入时间线。 | [05c-block-model.md](05c-block-model.md) |
 | 06 | TUI 对齐的结构化对话渲染器 | ✅ 已完成 | 假 block 树验证 folds、extmarks、内联 diff 和滚动。 | [06-conversation-renderer.md](06-conversation-renderer.md) |
 | 07A | 异步补全引擎 | ✅ 已完成 | 假 source 验证 pum、防抖、取消和过期响应。 | [07a-completion-engine.md](07a-completion-engine.md) |
 | 07B | OpenCode 补全源 | ✅ 已完成 | 假 client/session 验证文件、命令、Agent、Skill 候选及提交语义。 | [07b-completion-sources.md](07b-completion-sources.md) |
 | 08 | 会话与执行状态显示 | ✅ 已完成 | 假状态快照验证 winbar、权限等待和 window 生命周期。 | [08-session-status.md](08-session-status.md) |
-| 08A | OpenCode 语义快捷键兼容层 | ✅ 已完成 | 将 CLI command ID/keybind 配置映射为 buffer-local Neovim action；支持单击或自定义双击 Escape 调用 interrupt API。 | [08a-opencode-keybindings.md](08a-opencode-keybindings.md) |
+| 08A | OpenCode 语义快捷键兼容层 | ✅ 已完成 | 将 CLI command ID/keybind 配置映射为 buffer-local Neovim action；非当前 buffer 冲突检测回归通过。 | [08a-opencode-keybindings.md](08a-opencode-keybindings.md) |
 | 09A | Neovim 工具 server 与实例注册 | ✅ 已完成 | 假 HTTP 客户端验证认证、解析、限制、注册文件和生命周期。 | [09a-tool-server.md](09a-tool-server.md) |
 | 09B | OpenCode TypeScript 工具插件（可选 companion） | ✅ 已完成 | 假 Neovim server 验证工具注册、实例路由和请求取消；隔离真实 OpenCode 加载验证通过。 | [09b-opencode-tool-plugin.md](09b-opencode-tool-plugin.md) |
 | 09C | Open 与 Notify actions | ✅ 已完成 | 直接调用 handler 验证 buffer 导航和通知，不启动网络。 | [09c-open-notify-actions.md](09c-open-notify-actions.md) |
 | 09D | Diff view | ✅ 已完成 | headless Neovim 验证当前 buffer 基准、折叠 diff 和 window 状态恢复。 | [09d-diff-view.md](09d-diff-view.md) |
-| 10 | 公共装配与端到端集成 | ⬜ 未开始 | 统一 wiring、快捷键、文档及真实 OpenCode/Neovim 端到端验证。 | [10-integration.md](10-integration.md) |
+| 10 | 公共装配与端到端集成 | ✅ 已完成 | 统一 wiring、快捷键、文档及真实 OpenCode/Neovim 端到端验证。 | [10-integration.md](10-integration.md) |
 
 ## 核心交互
 

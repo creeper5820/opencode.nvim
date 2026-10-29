@@ -609,9 +609,66 @@ local function single_handler(state, entry)
   end
 end
 
+-- Read buffer-local mappings directly from the target buffer instead of
+-- calling maparg() in whichever buffer happens to be current.  This never
+-- switches windows or buffers.  attach()/detach() reject fast events, and the
+-- canonicalization helpers additionally degrade to exact lhs matching there.
+local function canonical_lhs(lhs)
+  if vim.in_fast_event() then
+    return lhs
+  end
+  local raw_ok, raw = pcall(vim.api.nvim_replace_termcodes, lhs, true, false, true)
+  if not raw_ok then
+    return lhs
+  end
+  local text_ok, text = pcall(vim.fn.keytrans, raw)
+  if text_ok and type(text) == "string" and text ~= "" then
+    return text
+  end
+  return lhs
+end
+
+local function buffer_keymaps(buf, mode)
+  if vim.in_fast_event() or not valid_buf(buf) then
+    return {}
+  end
+  local ok, maps = pcall(vim.api.nvim_buf_get_keymap, buf, mode)
+  if ok and type(maps) == "table" then
+    return maps
+  end
+  return {}
+end
+
+local function find_buffer_mapping(buf, mode, lhs)
+  local maps = buffer_keymaps(buf, mode)
+  if #maps == 0 then
+    return nil
+  end
+
+  local raw
+  if not vim.in_fast_event() then
+    local raw_ok, converted = pcall(vim.api.nvim_replace_termcodes, lhs, true, false, true)
+    if raw_ok then
+      raw = converted
+    end
+  end
+  local wanted = canonical_lhs(lhs)
+
+  for _, map in ipairs(maps) do
+    if type(map.lhsraw) == "string" and raw ~= nil
+        and (map.lhsraw == raw or map.lhsrawalt == raw)
+    then
+      return map
+    end
+    if type(map.lhs) == "string" and (map.lhs == lhs or canonical_lhs(map.lhs) == wanted) then
+      return map
+    end
+  end
+  return nil
+end
+
 local function mapping_exists(buf, mode, lhs)
-  local map = vim.fn.maparg(lhs, mode, false, true)
-  return type(map) == "table" and map.buffer == 1
+  return find_buffer_mapping(buf, mode, lhs) ~= nil
 end
 
 local function entries_for(resolved, opts, diagnostics)
@@ -704,6 +761,12 @@ end
 --- @return table|nil handle, table|nil error
 function M.attach(buf, opts)
   opts = opts or {}
+  if vim.in_fast_event() then
+    return nil, {
+      code = "fast_event",
+      message = "keybindings.attach must not run in a fast event",
+    }
+  end
   if not valid_buf(buf) then
     return nil, {
       code = "invalid_buffer",
@@ -810,6 +873,9 @@ end
 --- @param buf number
 --- @return boolean detached
 function M.detach(buf)
+  if vim.in_fast_event() then
+    return false
+  end
   local state = states[buf]
   if not state then
     return false
@@ -821,9 +887,8 @@ function M.detach(buf)
 
   if valid_buf(buf) then
     for _, mapping in ipairs(state.mappings) do
-      local current = vim.fn.maparg(mapping.lhs, mapping.mode, false, true)
+      local current = find_buffer_mapping(buf, mapping.mode, mapping.lhs)
       local owned = type(current) == "table"
-        and current.buffer == 1
         and current.desc == MAPPING_DESC_PREFIX .. mapping.command
       -- Do not remove a mapping another plugin replaced after attach().
       if owned then

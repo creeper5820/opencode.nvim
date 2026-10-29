@@ -93,23 +93,21 @@ local ok, err = xpcall(function()
       and require("opencode.ui").get_draft() == ""
   end)
   summary.accepted = true
-  -- The isolated service has no provider credentials. A real event batch must
-  -- still reach the block model: either the user message or a session.step
-  -- failure status block is acceptable proof of the SSE -> state -> renderer
-  -- path without depending on model access.
+  -- V2 inbox/history adapters must put the accepted user prompt into the live
+  -- conversation timeline even when no provider credentials are configured.
   local synced_ok = vim.wait(20000, function()
-    local blocks = opencode.get_state().blocks
-    return has_user_text(blocks, "hello from the isolated e2e") or has_event_status(blocks)
+    return has_user_text(opencode.get_state().blocks, "hello from the isolated e2e")
   end, 50)
   if not synced_ok then
     local current = opencode.get_state()
-    error("timed out: event batch applied; blocks=" .. vim.inspect(current.blocks)
+    error("timed out: V2 user message in timeline; blocks=" .. vim.inspect(current.blocks)
       .. " status=" .. vim.inspect(current.status)
       .. " session=" .. vim.inspect(current.session)
       .. " sync_error=" .. vim.inspect(current.last_sync_error))
   end
   summary.events_applied = true
-  summary.user_message = has_user_text(opencode.get_state().blocks, "hello from the isolated e2e")
+  summary.user_message = true
+  summary.event_status = has_event_status(opencode.get_state().blocks)
 
   -- Best-effort actual interrupt: only assert when the isolated service
   -- reports an active stream. A model-less isolated server may finish or fail

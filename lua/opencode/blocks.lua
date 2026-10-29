@@ -6,7 +6,8 @@
 --   * 05B event: { id, sequence, type, data }
 --   * native v1 envelope: { type, properties } (properties is treated as data)
 --   * native v2 session.* events: session.text.*, session.reasoning.*,
---     session.tool.* and session.compaction.*
+--     session.tool.*, session.compaction.*, session.execution.* and
+--     session.inbox.enqueued/delivered/cancelled/delivery.changed
 --   * snapshot message entries: { info, parts } (info/parts may also be
 --     inlined, and a map keyed by message id is accepted)
 --
@@ -112,6 +113,36 @@ local function event_generation(event)
   return first(event.generation, event.gen, event.sync_generation)
 end
 
+-- Native V2 SSE events keep their identity inside the decoded event object
+-- (`data.id == "evt_..."`), while v1 envelopes may expose it at the top level.
+-- 05B forwards both shapes, so dedupe must understand both without treating
+-- message/part ids as event ids.
+local function native_event_id(event)
+  local id = event_id(event)
+  if id ~= nil then
+    return id
+  end
+  local data = event.data
+  if type(data) == "table" and data.type == event_type(event) and data.id ~= nil then
+    return data.id
+  end
+  return nil
+end
+
+-- V2 public events are framed as { id, type, data = { ... } } whereas v1
+-- envelopes expose `properties` as data. 05B hands us the raw V2 event object,
+-- so unwrap only the shape that matches the event type.
+local function v2_payload(kind, data)
+  if type(data) == "table"
+    and kind ~= nil
+    and data.type == kind
+    and type(data.data) == "table"
+  then
+    return data.data
+  end
+  return data
+end
+
 local function session_id_of(event, data)
   return first(event.session_id, event.sessionID, data.sessionID, data.session_id)
 end
@@ -170,6 +201,90 @@ local function error_message(value)
   return nil
 end
 
+-- V2 history returns Session.Message.Info objects directly, for example
+--   { id = "msg_..", type = "user", text = "..." }
+--   { id = "msg_..", type = "assistant", content = { text/reasoning/tool } }
+-- v1 history uses { info = {...}, parts = {...} }.  Keep both adapters here so
+-- renderers see one tree shape.
+local V2_HISTORY_TYPES = {
+  user = true,
+  assistant = true,
+}
+
+local function is_v2_history_entry(entry)
+  if type(entry) ~= "table" or entry.id == nil then
+    return false
+  end
+  if type(entry.info) == "table" or type(entry.parts) == "table" then
+    return false
+  end
+  return V2_HISTORY_TYPES[entry.type] == true
+end
+
+local function v2_assistant_parts(message_id, content)
+  local parts = {}
+  local ordinals = { text = 0, reasoning = 0 }
+  for _, item in ipairs(type(content) == "table" and content or {}) do
+    if type(item) == "table" then
+      local kind = item.type
+      if kind == "text" then
+        local ordinal = ordinals.text
+        ordinals.text = ordinal + 1
+        parts[#parts + 1] = {
+          id = "text:" .. message_id .. ":" .. tostring(ordinal),
+          messageID = message_id,
+          type = "text",
+          text = item.text or "",
+          state = copy(item.state),
+        }
+      elseif kind == "reasoning" then
+        local ordinal = ordinals.reasoning
+        ordinals.reasoning = ordinal + 1
+        parts[#parts + 1] = {
+          id = "reasoning:" .. message_id .. ":" .. tostring(ordinal),
+          messageID = message_id,
+          type = "reasoning",
+          text = item.text or "",
+          state = copy(item.state),
+          time = copy(item.time),
+        }
+      elseif kind == "tool" then
+        local tool_id = first(item.id, "tool:" .. message_id .. ":" .. tostring(#parts))
+        parts[#parts + 1] = {
+          id = tool_id,
+          messageID = message_id,
+          type = "tool",
+          callID = item.id or tool_id,
+          tool = item.name,
+          state = copy(item.state),
+          time = copy(item.time),
+          executed = item.executed,
+        }
+      end
+    end
+  end
+  return parts
+end
+
+local function normalize_v2_history_entry(entry)
+  local info = copy(entry)
+  info.role = entry.type
+  local parts
+  if entry.type == "user" then
+    parts = {
+      {
+        id = "text:" .. entry.id .. ":0",
+        messageID = entry.id,
+        type = "text",
+        text = first(entry.text, ""),
+      },
+    }
+  else
+    parts = v2_assistant_parts(entry.id, entry.content)
+  end
+  return info, parts
+end
+
 local Model = {}
 Model.__index = Model
 
@@ -187,6 +302,7 @@ function M.new(options)
   self.part_order = {}
   self.tool_calls = {}
   self.permissions = {}
+  self.inbox_delivered = {}
   self.seen_events = {}
   self.subscribers = {}
   self.session_id = options.session_id
@@ -562,7 +678,9 @@ function Model:_upsert_part(part)
       self.tool_calls[call_id] = part.id
     end
     local input = first(part.input, state.input)
-    local output = first(part.output, state.output)
+    -- V2 tool history stores terminal content as a Content[] array under
+    -- state.content; v1 and V2 events use output/content directly.
+    local output = first(part.output, state.output, state.content)
     local metadata = merge_tables(state.metadata, part.metadata)
     metadata.part = data
     metadata.kind = metadata.kind or "tool"
@@ -669,6 +787,142 @@ function Model:_upsert_part(part)
     self:_replace(block, { metadata = metadata }, message_block and message_block.id or nil)
   end
   return block
+end
+
+function Model:_find_text_part(message_id)
+  for _, part_id in ipairs(self.part_order[message_id] or {}) do
+    local record = self.parts[part_id]
+    if record and record.type == "text" then
+      return part_id, record
+    end
+  end
+  return nil
+end
+
+---Update the first text part of a user message, preserving its native id when
+---history and live inbox events describe the same message.
+function Model:_upsert_user_text(message_id, text, fields)
+  local message = self.messages[message_id]
+  if not message then
+    return nil
+  end
+  local part_id, record = self:_find_text_part(message_id)
+  local data = record and copy(record.data) or {}
+  data.id = part_id or ("text:" .. message_id .. ":0")
+  data.messageID = message_id
+  data.type = "text"
+  data.text = type(text) == "string" and text or ""
+  for key, value in pairs(fields or {}) do
+    if data[key] == nil then
+      data[key] = copy(value)
+    end
+  end
+  self:_upsert_part(data)
+  return message
+end
+
+function Model:_set_inbox_metadata(message, patch)
+  if not message then
+    return
+  end
+  local metadata = shallow_copy(message.metadata)
+  local inbox = type(metadata.inbox) == "table" and copy(metadata.inbox) or {}
+  for key, value in pairs(patch or {}) do
+    inbox[key] = copy(value)
+  end
+  metadata.inbox = inbox
+  self:_replace(message, { metadata = metadata })
+end
+
+function Model:_inbox_enqueued(event, data)
+  local item = type(data.item) == "table" and data.item or {}
+  local payload = type(item.payload) == "table" and item.payload or {}
+  local inbox_id = first(data.inboxID, data.inbox_id, item.id, data.id)
+  if inbox_id == nil then
+    return self:_unknown(event, data)
+  end
+  if item.type ~= nil and item.type ~= "user" then
+    return self:_unknown(event, data)
+  end
+  if item.type == nil and type(payload.text) ~= "string" and type(data.text) ~= "string" then
+    return self:_unknown(event, data)
+  end
+
+  local outer = type(event.data) == "table" and event.data or {}
+  local time = type(data.time) == "table" and copy(data.time) or {}
+  if time.created == nil then
+    time.created = first(data.created, outer.created, event.created, 0)
+  end
+  local message = self.messages[inbox_id]
+  if not message then
+    message = self:_ensure_message({
+      id = inbox_id,
+      sessionID = first(data.sessionID, self.session_id),
+      role = "user",
+      type = "user",
+      time = time,
+    })
+  end
+  if not message then
+    return nil
+  end
+  self:_upsert_user_text(inbox_id, first(payload.text, data.text, ""), {
+    sessionID = first(data.sessionID, self.session_id),
+  })
+  local patch = {
+    enqueued = true,
+    delivery = first(item.delivery, data.delivery),
+    payload = copy(payload),
+  }
+  if self.inbox_delivered[inbox_id] then
+    patch.delivered = true
+    self.inbox_delivered[inbox_id] = nil
+  end
+  self:_set_inbox_metadata(message, patch)
+  return message
+end
+
+function Model:_inbox_delivered(data)
+  local inbox_id = first(data.inboxID, data.inbox_id, data.id)
+  if inbox_id == nil then
+    return nil
+  end
+  local message = self.messages[inbox_id]
+  if message then
+    self.inbox_delivered[inbox_id] = nil
+    local patch = { delivered = true }
+    if data.delivery ~= nil then
+      patch.delivery = data.delivery
+    end
+    self:_set_inbox_metadata(message, patch)
+    return message
+  end
+  self.inbox_delivered[inbox_id] = true
+  return nil
+end
+
+function Model:_inbox_delivery_changed(data)
+  local inbox_id = first(data.inboxID, data.inbox_id, data.id)
+  local message = inbox_id and self.messages[inbox_id] or nil
+  if message and data.delivery ~= nil then
+    self:_set_inbox_metadata(message, { delivery = data.delivery })
+  end
+  return message
+end
+
+function Model:_inbox_cancelled(data)
+  local inbox_id = first(data.inboxID, data.inbox_id, data.id)
+  if inbox_id == nil then
+    return nil
+  end
+  self.inbox_delivered[inbox_id] = nil
+  local message = self.messages[inbox_id]
+  if message and not (type(message.metadata) == "table"
+    and type(message.metadata.inbox) == "table"
+    and message.metadata.inbox.delivered) then
+    self:_remove_message({ messageID = inbox_id })
+  end
+  return message
 end
 
 function Model:_append_delta(data)
@@ -988,7 +1242,7 @@ function Model:_compaction(data, phase)
 end
 
 function Model:_unknown(event, data)
-  local id = event_id(event) or ("unknown:" .. tostring(self:_next_sequence()))
+  local id = native_event_id(event) or ("unknown:" .. tostring(self:_next_sequence()))
   local block = self.blocks[id]
   if block then
     self:_replace(block, {
@@ -1018,6 +1272,9 @@ end
 --   session.retry*             -> retry status block
 --   session.compaction.*       -> compaction status block
 --   session.execution.*|status|idle -> execution dimension
+--   session.inbox.enqueued     -> user message (id = inboxID) for item.type=user
+--   session.inbox.delivered    -> delivered metadata on the same message
+--   session.inbox.*            -> delivery/cancel metadata, never a duplicate
 --   session.text.*             -> assistant content
 --   session.reasoning.*        -> reasoning child
 --   session.tool.*             -> tool child (input/output/diff)
@@ -1026,7 +1283,7 @@ end
 -- metadata.part; renderers do not infer them from raw SSE.
 function Model:_apply_one(event)
   local kind = event_type(event)
-  local data = event_data(event)
+  local data = v2_payload(kind, event_data(event))
   if type(data) ~= "table" then
     data = { value = data }
   end
@@ -1050,6 +1307,14 @@ function Model:_apply_one(event)
     self:_ask_permission(data)
   elseif kind == "permission.replied" then
     self:_reply_permission(data)
+  elseif kind == "session.inbox.enqueued" then
+    self:_inbox_enqueued(event, data)
+  elseif kind == "session.inbox.delivered" then
+    self:_inbox_delivered(data)
+  elseif kind == "session.inbox.delivery.changed" then
+    self:_inbox_delivery_changed(data)
+  elseif kind == "session.inbox.cancelled" then
+    self:_inbox_cancelled(data)
   elseif kind == "session.error" then
     self:_session_error(data)
   elseif kind == "session.retry" or kind == "session.retry.scheduled" then
@@ -1297,16 +1562,26 @@ function Model:reset(snapshot, generation)
   end
   for _, entry in ipairs(entries) do
     if type(entry) == "table" then
-      local info = first(entry.info, entry.message, entry)
-      if type(info) ~= "table" then
-        info = {}
+      local info, parts
+      if is_v2_history_entry(entry) then
+        info, parts = normalize_v2_history_entry(entry)
+      else
+        info = first(entry.info, entry.message, entry)
+        if type(info) ~= "table" then
+          info = {}
+        end
+        parts = first(entry.parts, entry.part, info.parts, {})
       end
       local message = self:_ensure_message(info)
-      local parts = first(entry.parts, entry.part, info.parts, {})
-      if type(parts) == "table" then
-        for _, part in ipairs(parts) do
-          self:_upsert_part(part)
-        end
+      if type(parts) ~= "table" then
+        parts = {}
+      end
+      for _, part in ipairs(parts) do
+        self:_upsert_part(part)
+      end
+      if message and message.type == "user" and self.inbox_delivered[message.id] then
+        self.inbox_delivered[message.id] = nil
+        self:_set_inbox_metadata(message, { delivered = true })
       end
       if message and message.status ~= "failed" then
         if message_time(info, "completed") then
@@ -1396,7 +1671,7 @@ function Model:apply_event(event, generation)
       self.generation = gen
     end
   end
-  local id = event_id(event)
+  local id = native_event_id(event)
   if id and self.seen_events[id] then
     return false
   end
@@ -1431,7 +1706,7 @@ function Model:apply_batch(batch)
       if gen ~= nil and gen > self.generation then
         self.generation = gen
       end
-      local id = event_id(event)
+      local id = native_event_id(event)
       if not id or not self.seen_events[id] then
         self:_apply_one(event)
         if id then
