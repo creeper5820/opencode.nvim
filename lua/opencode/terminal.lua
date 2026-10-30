@@ -151,6 +151,8 @@ function Terminal:_clear_autocmds()
     pcall(vim.api.nvim_del_autocmd, id)
   end
   self.autocmds = {}
+  self:_clear_window_guard()
+  self:_clear_wheel_guard()
 end
 
 function Terminal:_remember_width()
@@ -234,8 +236,17 @@ function Terminal:_watch_window(win)
   end
 end
 
+local function is_vertical(layout)
+  return layout == "right" or layout == "left"
+end
+
 function Terminal:_set_window_options(win)
+  local layout = (self.config.window or {}).layout or "right"
   pcall(function()
+    vim.wo[win].winfixwidth = is_vertical(layout)
+    vim.wo[win].winfixheight = not is_vertical(layout)
+    vim.wo[win].scrolloff = 0
+    vim.wo[win].sidescrolloff = 0
     vim.wo[win].number = false
     vim.wo[win].relativenumber = false
     vim.wo[win].signcolumn = "no"
@@ -255,6 +266,195 @@ function Terminal:_resize(win)
     pcall(vim.api.nvim_win_set_width, win, math.max(1, math.min(size, vim.o.columns - 1)))
   else
     pcall(vim.api.nvim_win_set_height, win, math.max(1, math.min(size, vim.o.lines - 2)))
+  end
+end
+
+local COMPANION_SPLIT = {
+  right = "leftabove vnew",
+  left = "rightbelow vnew",
+  above = "rightbelow new",
+  below = "leftabove new",
+}
+
+--- The OpenCode window must never fill its tab page.  When every other
+--- non-floating window is gone, open an empty editor window beside it.
+function Terminal:_ensure_not_alone()
+  local win = self.state.win
+  if not self:is_running() or not valid_win(win) or vim.v.exiting ~= vim.NIL then
+    return
+  end
+  local tab = vim.api.nvim_win_get_tabpage(win)
+  for _, other in ipairs(vim.api.nvim_tabpage_list_wins(tab)) do
+    if other ~= win and vim.api.nvim_win_get_config(other).relative == "" then
+      return
+    end
+  end
+  local layout = (self.config.window or {}).layout or "right"
+  local ok = pcall(vim.api.nvim_win_call, win, function()
+    vim.cmd(COMPANION_SPLIT[layout] or COMPANION_SPLIT.right)
+  end)
+  if not ok then
+    return
+  end
+  self:_resize(win)
+  self:_apply_remembered_width()
+end
+
+function Terminal:_install_window_guard()
+  local group = vim.api.nvim_create_augroup("OpencodeNvimWindowGuard", { clear = true })
+  self.guard_group = group
+  local pending = false
+  vim.api.nvim_create_autocmd({ "WinClosed", "WinEnter", "BufEnter", "TabEnter" }, {
+    group = group,
+    callback = function()
+      if pending then
+        return
+      end
+      pending = true
+      vim.schedule(function()
+        pending = false
+        self:_ensure_not_alone()
+      end)
+    end,
+  })
+end
+
+function Terminal:_clear_window_guard()
+  if self.guard_group then
+    pcall(vim.api.nvim_del_augroup_by_id, self.guard_group)
+    self.guard_group = nil
+  end
+end
+
+function Terminal:_resize_by(delta)
+  local win = self.state.win
+  if not valid_win(win) then
+    return
+  end
+  local layout = (self.config.window or {}).layout or "right"
+  if is_vertical(layout) then
+    local width = vim.api.nvim_win_get_width(win) + delta
+    pcall(vim.api.nvim_win_set_width, win, math.max(1, math.min(width, vim.o.columns - 1)))
+  else
+    local height = vim.api.nvim_win_get_height(win) + delta
+    pcall(vim.api.nvim_win_set_height, win, math.max(1, math.min(height, vim.o.lines - 2)))
+  end
+end
+
+--- Buffer-local mappings: resize keys stay with Neovim, and Neovim never
+--- scrolls the terminal viewport away from the TUI.
+local WHEEL_KEYS = { "<ScrollWheelUp>", "<ScrollWheelDown>", "<ScrollWheelLeft>", "<ScrollWheelRight>" }
+local WHEEL_MODES = { "n", "x", "s", "o", "i", "t" }
+local WHEEL_DESC = "OpenCode: guard mouse wheel"
+
+local function global_mapping(mode, lhs)
+  local ok, maps = pcall(vim.api.nvim_get_keymap, mode)
+  if not ok then
+    return nil
+  end
+  local wanted = vim.api.nvim_replace_termcodes(lhs, true, false, true)
+  for _, map in ipairs(maps) do
+    if map.lhs and vim.api.nvim_replace_termcodes(map.lhs, true, false, true) == wanted then
+      return map
+    end
+  end
+  return nil
+end
+
+local function run_mapping(map, lhs)
+  if map == nil then
+    vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(lhs, true, false, true), "in", false)
+    return
+  end
+  if type(map.callback) == "function" then
+    local result = map.callback()
+    if map.expr == 1 and type(result) == "string" and result ~= "" then
+      local keys = map.replace_keycodes == 1 and vim.api.nvim_replace_termcodes(result, true, false, true) or result
+      vim.api.nvim_feedkeys(keys, "in", false)
+    end
+    return
+  end
+  local rhs = map.rhs or ""
+  if map.expr == 1 then
+    rhs = vim.fn.eval(rhs)
+  end
+  if rhs ~= "" then
+    vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(rhs, true, false, true),
+      map.noremap == 1 and "in" or "im", false)
+  end
+end
+
+--- Global mouse-wheel guard.  Wheel events always target the window under the
+--- mouse, not the current buffer, so buffer-local mappings cannot block them.
+--- Events over an unfocused OpenCode window are dropped; events over the
+--- focused one reach the TUI; everything else keeps its previous behavior.
+function Terminal:_install_wheel_guard()
+  if self.wheel_saved then
+    return
+  end
+  self.wheel_saved = {}
+  for _, mode in ipairs(WHEEL_MODES) do
+    for _, lhs in ipairs(WHEEL_KEYS) do
+      local previous = global_mapping(mode, lhs)
+      if previous and previous.desc == WHEEL_DESC then
+        previous = nil
+      end
+      self.wheel_saved[#self.wheel_saved + 1] = { mode = mode, lhs = lhs, map = previous }
+      pcall(vim.keymap.set, mode, lhs, function()
+        local win = self.state.win
+        local over = vim.fn.getmousepos().winid
+        if valid_win(win) and over == win then
+          if mode == "t" and vim.api.nvim_get_current_win() == win then
+            vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(lhs, true, false, true), "in", false)
+          end
+          return
+        end
+        run_mapping(previous, lhs)
+      end, { silent = true, desc = WHEEL_DESC })
+    end
+  end
+end
+
+function Terminal:_clear_wheel_guard()
+  local saved = self.wheel_saved
+  self.wheel_saved = nil
+  if not saved then
+    return
+  end
+  for _, entry in ipairs(saved) do
+    local current = global_mapping(entry.mode, entry.lhs)
+    if current and current.desc == WHEEL_DESC then
+      pcall(vim.keymap.del, entry.mode, entry.lhs)
+      if entry.map then
+        pcall(vim.fn.mapset, entry.mode, false, entry.map)
+      end
+    end
+  end
+end
+
+function Terminal:_install_buffer_keymaps(buf)
+  local keys = (self.config.window or {}).resize_keys
+  if type(keys) == "table" then
+    local step = keys.step or 2
+    local function map(lhs, delta, desc)
+      if type(lhs) == "string" and lhs ~= "" then
+        pcall(vim.keymap.set, { "t", "n" }, lhs, function()
+          self:_resize_by(delta)
+        end, { buffer = buf, silent = true, nowait = true, desc = desc })
+      end
+    end
+    map(keys.shrink, -step, "OpenCode: shrink window")
+    map(keys.grow, step, "OpenCode: grow window")
+  end
+  for _, lhs in ipairs({
+    "<C-e>",
+    "<C-y>",
+    "<C-u>",
+    "<C-d>",
+    "<C-f>",
+    "<C-b>",
+  }) do
+    pcall(vim.keymap.set, { "n", "v" }, lhs, "<Nop>", { buffer = buf, silent = true })
   end
 end
 
@@ -520,12 +720,18 @@ function Terminal:_spawn(cmd, cwd)
   self.state.pid = vim.fn.jobpid(job)
   self.state.running = self.state.chan ~= nil and self.state.chan > 0
   self.state.started_at = uv.hrtime()
+  pcall(function()
+    vim.bo[buf].scrollback = 1
+  end)
+  self:_install_buffer_keymaps(buf)
+  self:_install_wheel_guard()
 
   local win, win_err = self:_show_window()
   if not win then
     self:stop()
     return false, win_err
   end
+  self:_install_window_guard()
 
   local ok_watch = pcall(vim.api.nvim_create_autocmd, "BufWipeout", {
     buffer = buf,

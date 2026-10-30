@@ -106,6 +106,21 @@ width you set during the current Neovim session. Hiding/closing and reopening
 restores that width, clamped to the current `vim.o.columns`. Horizontal
 layouts use `window.size`. Disable this with `window.remember_width = false`.
 
+`window.resize_keys` (default `<C-Left>` / `<C-Right>`, step 2) are
+buffer-local Terminal-mode mappings that resize the OpenCode window instead of
+reaching the TUI. Set `window.resize_keys = false` to forward them to OpenCode.
+
+The OpenCode window never fills its tab page. When every other non-floating
+window closes, an empty editor window is opened beside it and the OpenCode
+size is restored. The window uses `winfixwidth`/`winfixheight`.
+
+Neovim never scrolls the terminal viewport: the buffer uses `scrollback=1` and
+Normal/Visual scroll keys are mapped to `<Nop>` inside it. A global mouse-wheel
+guard checks the window under the mouse: wheel events over the unfocused
+OpenCode window are dropped, events over the focused window reach OpenCode for
+its own message list scrolling, and other windows keep their previous wheel
+mappings, which are restored when the TUI stops.
+
 ## Configuration
 
 ```lua
@@ -119,6 +134,7 @@ require("opencode").setup({
     layout = "right",       -- right | left | above | below
     size = 80,
     remember_width = true,
+    resize_keys = { shrink = "<C-Left>", grow = "<C-Right>", step = 2 },
   },
   keymaps = {
     toggle = "<leader>oo",

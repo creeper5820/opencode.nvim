@@ -24,6 +24,13 @@ M.defaults = {
     -- Remember the user's actual width for vertical layouts within this
     -- Neovim session.
     remember_width = true,
+    -- Terminal-mode keys that resize the OpenCode window. Set to false to
+    -- forward these keys to OpenCode instead.
+    resize_keys = {
+      shrink = "<C-Left>",
+      grow = "<C-Right>",
+      step = 2,
+    },
   },
   keymaps = {
     toggle = "<leader>oo",
@@ -179,6 +186,19 @@ local function validate_config(config)
   validate_dimension("window.size", config.window.size, 1, 1000)
   if type(config.window.remember_width) ~= "boolean" then
     error("opencode: window.remember_width must be a boolean", 0)
+  end
+  local resize_keys = config.window.resize_keys
+  if resize_keys ~= false then
+    if type(resize_keys) ~= "table" then
+      error("opencode: window.resize_keys must be a table or false", 0)
+    end
+    for _, name in ipairs({ "shrink", "grow" }) do
+      local value = resize_keys[name]
+      if value ~= false and (type(value) ~= "string" or value == "") then
+        error(("opencode: window.resize_keys.%s must be a non-empty string or false"):format(name), 0)
+      end
+    end
+    validate_dimension("window.resize_keys.step", resize_keys.step, 1, 1000)
   end
 
   validate_keymaps(config.keymaps)
