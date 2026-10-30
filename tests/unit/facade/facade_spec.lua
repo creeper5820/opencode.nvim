@@ -67,4 +67,39 @@ test.describe("public facade", function()
     pcall(opencode.stop)
     vim.fn.delete(dir, "rf")
   end)
+
+  test.it("preserves Neovim window mappings while passing text-like terminal mappings through", function()
+    pcall(function()
+      require("opencode").stop()
+    end)
+    test.reload()
+    local opencode = require("opencode")
+    local dir = tempdir()
+    vim.keymap.set("t", "<C-h>", function() end, { desc = "test window callback" })
+    vim.keymap.set("t", "<C-l>", "<C-w>l", { noremap = true, desc = "test window command" })
+    vim.keymap.set("t", "jk", "<C-\\><C-n>", { noremap = true, desc = "test terminal escape" })
+
+    opencode.setup({
+      cmd = { "sh", "-c", "printf ready; sleep 20" },
+      window = { layout = "right", size = 40 },
+    })
+    test.truthy(opencode.open({ directory = dir }))
+
+    local buf = vim.api.nvim_get_current_buf()
+    local maps = vim.api.nvim_buf_get_keymap(buf, "t")
+    local by_lhs = {}
+    for _, map in ipairs(maps) do
+      by_lhs[map.lhs] = map
+    end
+    test.falsy(by_lhs["<C-h>"], "window callback must not be shadowed")
+    test.falsy(by_lhs["<C-l>"], "window command must not be shadowed")
+    test.truthy(by_lhs["jk"], "text-like mapping should have a raw fallback")
+    test.equal("OpenCode: pass through jk", by_lhs["jk"].desc)
+
+    opencode.stop()
+    vim.keymap.del("t", "<C-h>")
+    vim.keymap.del("t", "<C-l>")
+    vim.keymap.del("t", "jk")
+    vim.fn.delete(dir, "rf")
+  end)
 end)

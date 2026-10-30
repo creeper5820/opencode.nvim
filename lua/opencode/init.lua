@@ -54,10 +54,28 @@ local function terminal_is_current(rt)
     and vim.api.nvim_get_current_buf() == rt.terminal.state.buf
 end
 
---- Keep global Terminal-mode mappings from stealing keys from the embedded TUI.
---- Each global Term-mode mapping is shadowed in the OpenCode buffer by a raw
---- byte forward of its own lhs.  This is still plain pass-through: there is no
---- Normal routing, command matching or state machine.
+--- Only text-like global mappings need a raw terminal fallback. Lua callbacks
+--- and mappings that execute a window command belong to Neovim, not the TUI.
+local function should_forward_terminal_mapping(map)
+  if type(map.callback) == "function" then
+    return false
+  end
+  if type(map.rhs) ~= "string" then
+    return true
+  end
+  if map.rhs:lower():find("wincmd", 1, true) then
+    return false
+  end
+  local ok, rhs = pcall(vim.api.nvim_replace_termcodes, map.rhs, true, false, true)
+  local ctrl_w_ok, ctrl_w = pcall(vim.api.nvim_replace_termcodes, "<C-w>", true, false, true)
+  if ok and ctrl_w_ok and rhs:sub(1, #ctrl_w) == ctrl_w then
+    return false
+  end
+  return true
+end
+
+--- Keep text-like global Terminal-mode mappings from stealing keys from the
+--- embedded TUI. Window-management mappings retain their normal Neovim behavior.
 local function install_terminal_passthrough(rt)
   local buf = rt.terminal.state.buf
   if not valid_buf(buf) or rt.passthrough_buf == buf then
@@ -69,7 +87,7 @@ local function install_terminal_passthrough(rt)
     return
   end
   for _, map in ipairs(maps) do
-    if type(map.lhs) == "string" and map.lhs ~= "" then
+    if type(map.lhs) == "string" and map.lhs ~= "" and should_forward_terminal_mapping(map) then
       local bytes_ok, bytes = pcall(vim.api.nvim_replace_termcodes, map.lhs, true, false, true)
       if bytes_ok and type(bytes) == "string" and bytes ~= "" then
         pcall(vim.keymap.set, "t", map.lhs, function()
